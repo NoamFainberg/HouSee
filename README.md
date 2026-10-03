@@ -27,3 +27,10 @@ Open [http://localhost:3000](http://localhost:3000), drop 3–8 listing photos, 
 4. ffmpeg stitches a master MP4 with a title card and room labels
 
 This is a stills walkthrough, not a filmed gimbal tour. Wide, well-lit photos work best.
+
+## Deployment
+
+- **GitHub:** [github.com/NoamFainberg/HouSee](https://github.com/NoamFainberg/HouSee)
+- **Vercel:** [housee.vercel.app](https://housee.vercel.app) (UI deploy; full pipeline runs locally today)
+
+See **[DEPLOYMENT.md](./DEPLOYMENT.md)** for Vercel env vars, limitations, and the path to production (blob storage, Inngest jobs, ffmpeg worker).
