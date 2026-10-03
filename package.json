@@ -4,20 +4,27 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:inngest": "concurrently -n next,inngest -c cyan,magenta \"next dev\" \"npx inngest-cli@latest dev -u http://localhost:3000/api/inngest\"",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@higgsfield/client": "^0.2.1",
+    "inngest": "^4.18.1",
+    "lucide-react": "^1.33.0",
     "next": "16.3.2",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "sharp": "^0.35.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "concurrently": "^10.0.5",
     "eslint": "^9",
     "eslint-config-next": "16.3.2",
     "tailwindcss": "^4",

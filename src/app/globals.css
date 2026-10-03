@@ -1,26 +1,58 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --ink: #16110c;
+  --paper: #f3ece2;
+  --paper-2: #e7ddd0;
+  --brass: #b08a4f;
+  --brass-2: #d4b483;
+  --muted: #7a6d5f;
+  --line: rgba(22, 17, 12, 0.12);
+  --danger: #8f2d2d;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-ink: var(--ink);
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-brass: var(--brass);
+  --color-brass-2: var(--brass-2);
+  --color-muted: var(--muted);
+  --font-sans: var(--font-outfit);
+  --font-serif: var(--font-fraunces);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(176, 138, 79, 0.14), transparent 50%),
+    linear-gradient(180deg, #f7f1e8 0%, var(--paper) 40%, #efe6d8 100%);
+  color: var(--ink);
+  font-family: var(--font-outfit), sans-serif;
+}
+
+.serif {
+  font-family: var(--font-fraunces), serif;
+}
+
+.grain {
+  position: relative;
+}
+
+.grain::before {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  opacity: 0.18;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='.35'/%3E%3C/svg%3E");
 }
