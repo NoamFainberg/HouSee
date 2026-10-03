@@ -94,7 +94,60 @@ CRITICAL RULES:
 - Forbidden words in higgsfield_prompt: "walk through door" unless that exact opening is visible in the start frame
 - If two views cannot connect without hallucination, set can_blend=false and explain why
 - Keep each higgsfield_prompt under 420 characters
-- room_type must be one of: exterior, entry, living, kitchen, dining, bedroom, bathroom, balcony, view, amenity, other, floorplan`;
+- room_type must be one of: exterior, entry, living, kitchen, dining, bedroom, bathroom, balcony, view, amenity, other, floorplan
+- Same-room wide rotation (>25° between views): use locked tripod, yaw-only, max 20° pan — NEVER translate the camera through the room or pass through walls/door frames visible in START
+- Name solid walls and door frames in START that must stay closed and fixed`;
+}
+
+const CONSERVATIVE_MORPH_AVOID = [
+  "passing through walls",
+  "opening doors",
+  "forward dolly",
+  "translating camera",
+  "walking through doorways",
+  "people",
+  "cameras",
+  "equipment",
+  "flying doors",
+];
+
+function parsePanDegrees(cameraPath: string): number | null {
+  const match = cameraPath.match(/(\d+)\s*-?\s*degree/i);
+  return match ? Number(match[1]) : null;
+}
+
+export function tuneTransitionPrompt(
+  edge: WalkthroughTransitionPlan,
+  transitionIndex: number,
+  start: Photo,
+  end: Photo,
+): WalkthroughTransitionPlan {
+  const sameRoom = start.room_type === end.room_type;
+  const degrees = parsePanDegrees(edge.camera_path);
+  const needsConservative =
+    sameRoom &&
+    (transitionIndex === 0 || (degrees !== null && degrees > 25));
+
+  if (!needsConservative) {
+    return edge;
+  }
+
+  const avoid = [...new Set([...edge.avoid, ...CONSERVATIVE_MORPH_AVOID])];
+  const cameraPath =
+    "Locked tripod, yaw-only rotation, max 20-degree horizontal pan. Zero forward motion, zero lateral travel. All walls and door frames stay closed and fixed.";
+  const basePrompt = `${CINEMATIC_PROMPT_PREFIX} Morph from opening frame to closing frame inside the same room. ${edge.spatial_relationship || "Stay inside visible geometry."} Walls, door frames, and ceiling edges remain solid — only a slow horizontal turn on a locked tripod, never passing through walls or open doorways.`;
+
+  return {
+    ...edge,
+    camera_path: cameraPath,
+    avoid,
+    higgsfield_prompt: finalizeHiggsfieldPrompt(
+      basePrompt,
+      edge.shared_elements,
+      cameraPath,
+      avoid,
+    ),
+  };
 }
 
 function transitionVisionPrompt(fromLabel: string, toLabel: string): string {
@@ -351,25 +404,32 @@ function parseWalkthroughPlan(raw: string, photos: Photo[]): WalkthroughPlan {
       const cameraPath = edge?.camera_path?.trim() ?? "";
       const fallbackPrompt = transitionPrompt(start.room_type, end.room_type);
       const basePrompt = edge?.higgsfield_prompt?.trim() || fallbackPrompt;
-      transitions.push({
-        from_photo_id: start.id,
-        to_photo_id: end.id,
-        connection_score: Math.min(
-          1,
-          Math.max(0, Number(edge?.connection_score) || 0.5),
+      transitions.push(
+        tuneTransitionPrompt(
+          {
+            from_photo_id: start.id,
+            to_photo_id: end.id,
+            connection_score: Math.min(
+              1,
+              Math.max(0, Number(edge?.connection_score) || 0.5),
+            ),
+            spatial_relationship: edge?.spatial_relationship?.trim() ?? "",
+            shared_elements: shared,
+            camera_path: cameraPath,
+            can_blend: edge?.can_blend !== false,
+            avoid,
+            higgsfield_prompt: finalizeHiggsfieldPrompt(
+              basePrompt,
+              shared,
+              cameraPath,
+              avoid,
+            ),
+          },
+          i,
+          start,
+          end,
         ),
-        spatial_relationship: edge?.spatial_relationship?.trim() ?? "",
-        shared_elements: shared,
-        camera_path: cameraPath,
-        can_blend: edge?.can_blend !== false,
-        avoid,
-        higgsfield_prompt: finalizeHiggsfieldPrompt(
-          basePrompt,
-          shared,
-          cameraPath,
-          avoid,
-        ),
-      });
+      );
     }
 
     return {
@@ -554,14 +614,36 @@ export async function enrichClipPrompt(
   const end = record.photos.find((photo) => photo.id === clip.end_photo_id);
   if (!start || !end) return clip.prompt;
 
-  const plan = await planTransitionPair(start, end);
+  const edge = record.walkthrough_plan?.transitions.find(
+    (item) =>
+      item.from_photo_id === clip.photo_id &&
+      item.to_photo_id === clip.end_photo_id,
+  );
+  const prompt = edge
+    ? tuneTransitionPrompt(edge, clip.sort_order, start, end).higgsfield_prompt
+    : (await planTransitionPair(start, end)).higgsfield_prompt;
+
   await mutateTour(tourId, (current) => {
     const target = current.clips.find((item) => item.id === clipId);
     if (!target) return;
-    target.prompt = plan.higgsfield_prompt;
+    target.prompt = prompt;
     target.updated_at = new Date().toISOString();
+    const planEdge = current.walkthrough_plan?.transitions.find(
+      (item) =>
+        item.from_photo_id === clip.photo_id &&
+        item.to_photo_id === clip.end_photo_id,
+    );
+    if (planEdge) {
+      planEdge.higgsfield_prompt = prompt;
+      planEdge.camera_path = tuneTransitionPrompt(
+        planEdge,
+        clip.sort_order,
+        start,
+        end,
+      ).camera_path;
+    }
   });
-  return plan.higgsfield_prompt;
+  return prompt;
 }
 
 export async function enrichTransitionPrompts(tourId: string): Promise<void> {
@@ -578,8 +660,25 @@ export async function enrichTransitionPrompts(tourId: string): Promise<void> {
             item.from_photo_id === clip.photo_id &&
             item.to_photo_id === clip.end_photo_id,
         );
-        if (edge) {
-          clip.prompt = edge.higgsfield_prompt;
+        if (edge && clip.photo_id && clip.end_photo_id) {
+          const start = current.photos.find(
+            (photo) => photo.id === clip.photo_id,
+          );
+          const end = current.photos.find(
+            (photo) => photo.id === clip.end_photo_id,
+          );
+          if (start && end) {
+            const tuned = tuneTransitionPrompt(
+              edge,
+              clip.sort_order,
+              start,
+              end,
+            );
+            clip.prompt = tuned.higgsfield_prompt;
+            edge.higgsfield_prompt = tuned.higgsfield_prompt;
+            edge.camera_path = tuned.camera_path;
+            edge.avoid = tuned.avoid;
+          }
           clip.updated_at = new Date().toISOString();
         }
       }
