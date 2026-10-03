@@ -1,6 +1,7 @@
 import {
   clipDurationSeconds,
   getHiggsfieldCredentials,
+  heroModel,
   higgsfieldEnhancePrompt,
   transitionModel,
   videoFallbackModel,
@@ -145,7 +146,7 @@ function extractVideoUrl(payload: unknown): string | null {
 }
 
 export function modelForArgs(args: GenerateArgs): string {
-  return args.endImageUrl ? transitionModel() : videoModel();
+  return args.endImageUrl ? transitionModel() : heroModel();
 }
 
 export async function submitGeneration(
@@ -209,12 +210,16 @@ export async function submitWalkthroughGeneration(
     return submitGeneration(transitionModel(), args);
   }
 
-  const primary = videoModel();
+  const primary = heroModel();
   try {
     return await submitGeneration(primary, args);
   } catch (primaryError) {
     const fallback = videoFallbackModel();
-    if (fallback === primary) throw primaryError;
+    if (fallback === primary) {
+      const legacy = videoModel();
+      if (legacy === primary) throw primaryError;
+      return submitGeneration(legacy, args);
+    }
     return submitGeneration(fallback, {
       prompt: args.prompt,
       startImageUrl: args.startImageUrl,

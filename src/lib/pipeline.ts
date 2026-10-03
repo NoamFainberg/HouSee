@@ -72,19 +72,43 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
         updated_at: now,
       });
     } else {
-      for (let index = 0; index < photos.length - 1; index += 1) {
-        const start = photos[index]!;
-        const end = photos[index + 1]!;
+      let clipIndex = 0;
+      for (let index = 0; index < photos.length; index += 1) {
+        const current = photos[index]!;
+        const next = photos[index + 1];
+        if (next && current.room_type !== next.room_type) {
+          clips.push({
+            id: crypto.randomUUID(),
+            tour_id: tourId,
+            photo_id: current.id,
+            end_photo_id: next.id,
+            room_type: current.room_type,
+            sort_order: clipIndex,
+            status: "pending",
+            prompt: transitionPrompt(current.room_type, next.room_type),
+            camera_move: "walkthrough_link",
+            higgsfield_request_id: null,
+            video_path: null,
+            video_url: null,
+            error: null,
+            created_at: now,
+            updated_at: now,
+          });
+          clipIndex += 1;
+          continue;
+        }
+
+        const preset = CAMERA_PRESETS[current.room_type];
         clips.push({
           id: crypto.randomUUID(),
           tour_id: tourId,
-          photo_id: start.id,
-          end_photo_id: end.id,
-          room_type: start.room_type,
-          sort_order: index,
+          photo_id: current.id,
+          end_photo_id: null,
+          room_type: current.room_type,
+          sort_order: clipIndex,
           status: "pending",
-          prompt: transitionPrompt(start.room_type, end.room_type),
-          camera_move: "walkthrough_link",
+          prompt: preset.prompt,
+          camera_move: preset.move,
           higgsfield_request_id: null,
           video_path: null,
           video_url: null,
@@ -92,6 +116,7 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
           created_at: now,
           updated_at: now,
         });
+        clipIndex += 1;
       }
     }
 

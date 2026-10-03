@@ -40,7 +40,22 @@ async function titlePng(title: string): Promise<Buffer> {
   return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
-function xfadeFilter(clipCount: number, clipDuration: number, fade: number) {
+async function probeDuration(path: string): Promise<number> {
+  const probe = await execFileAsync("ffprobe", [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    path,
+  ]);
+  const parsed = Number(probe.stdout.trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : clipDurationSeconds();
+}
+
+function xfadeFilter(durations: number[], fade: number) {
+  const clipCount = durations.length;
   const scaled: string[] = [];
   for (let i = 0; i < clipCount; i += 1) {
     scaled.push(
@@ -52,14 +67,14 @@ function xfadeFilter(clipCount: number, clipDuration: number, fade: number) {
   }
   const fades: string[] = [];
   let last = "v0";
-  let offset = clipDuration - fade;
+  let offset = Math.max(0, durations[0]! - fade);
   for (let i = 1; i < clipCount; i += 1) {
     const next = i === clipCount - 1 ? "vout" : `x${i}`;
     fades.push(
       `[${last}][v${i}]xfade=transition=fade:duration=${fade}:offset=${offset.toFixed(2)}[${next}]`,
     );
     last = next;
-    offset += clipDuration - fade;
+    offset += Math.max(0, durations[i]! - fade);
   }
   return `${scaled.join(";")};${fades.join(";")}`;
 }
@@ -143,6 +158,9 @@ export async function stitchTour(tourId: string): Promise<string> {
     ]);
 
     const allVideos = [titleVideo, ...clipPaths];
+    const segmentDurations = await Promise.all(
+      allVideos.map((path) => probeDuration(path)),
+    );
     const concatList = join(work, "concat.txt");
     await writeFile(
       concatList,
@@ -157,7 +175,7 @@ export async function stitchTour(tourId: string): Promise<string> {
     }
     args.push(
       "-filter_complex",
-      xfadeFilter(allVideos.length, clipDuration, fade),
+      xfadeFilter(segmentDurations, fade),
       "-map",
       "[vout]",
       "-an",

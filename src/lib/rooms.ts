@@ -31,7 +31,7 @@ export const ROOM_LABELS: Record<RoomType, string> = {
 };
 
 const CINEMATIC =
-  "Photoreal cinematic real-estate walkthrough, 24mm gimbal, natural light, locked architecture, no people, no morphing walls, no extra furniture, no text overlay.";
+  "Photoreal cinematic real-estate walkthrough, 24mm gimbal, natural light, locked architecture, no people, no morphing walls, no extra furniture, no text overlay, no walking figures, no new doorways, no disappearing walls, geometry stays fixed.";
 
 export const CINEMATIC_PROMPT_PREFIX = CINEMATIC;
 
@@ -50,8 +50,8 @@ export const CAMERA_PRESETS: Record<RoomType, CameraPreset> = {
     prompt: `${CINEMATIC} Slow steadicam dolly forward through the entry as if walking inside.`,
   },
   living: {
-    move: "soft_orbit",
-    prompt: `${CINEMATIC} Slow 15-degree orbit through the living room, revealing seating and windows.`,
+    move: "micro_pan",
+    prompt: `${CINEMATIC} Nearly static tripod shot with an imperceptible 5-degree pan across the living room. All walls, doors, windows, and furniture remain exactly as photographed.`,
   },
   dining: {
     move: "dolly_across",
@@ -116,8 +116,18 @@ export function inferRoomFromFilename(filename: string): RoomType {
   return "other";
 }
 
+export function sameRoomAnglePrompt(room: RoomType): string {
+  const label = ROOM_LABELS[room].toLowerCase();
+  return `${CINEMATIC} Hold inside the ${label} shown in the photo. Slow cinematic orbit or gentle lateral pan only — no forward walk, no passing through walls, no invented doorways or new rooms. Walls, ceiling, and furniture stay fixed; only the camera moves within the visible space.`;
+}
+
 export function transitionPrompt(from: RoomType, to: RoomType): string {
-  return `${CINEMATIC} One continuous steadicam walk from the ${ROOM_LABELS[from].toLowerCase()} into the ${ROOM_LABELS[to].toLowerCase()}. The opening frame matches the first room; the closing frame matches the second room. Forward camera travel through doorways and sightlines, no cuts, no people, stable architecture.`;
+  if (from === to) {
+    return sameRoomAnglePrompt(from);
+  }
+  const fromLabel = ROOM_LABELS[from].toLowerCase();
+  const toLabel = ROOM_LABELS[to].toLowerCase();
+  return `${CINEMATIC} One continuous steadicam move from the ${fromLabel} into the ${toLabel}. Opening frame matches the first photo exactly; closing frame matches the second photo exactly. Use only doorways, hallways, or sightlines visible in the opening frame — never pass through solid walls or invent new openings. No people, stable architecture, no morphing geometry.`;
 }
 
 export function clipLabel(from: RoomType, to?: RoomType): string {

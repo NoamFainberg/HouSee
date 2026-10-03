@@ -5,7 +5,6 @@ import {
   isRoomType,
   ROOM_LABELS,
   transitionPrompt,
-  walkthroughRank,
 } from "./rooms";
 import { mutateTour, readPhotoBytes, readTourRecord } from "./store";
 import type { Photo, RoomType } from "./types";
@@ -39,36 +38,41 @@ For each image (in order, 0-based index) return JSON:
 room_type must be one of:
 exterior, entry, living, kitchen, dining, bedroom, bathroom, balcony, view, amenity, other, floorplan
 
-Reject (reject=true) floor plans, maps, screenshots, logos, collages, extreme close-ups of clutter, and near-duplicates (set duplicate_of to the earlier index).
+Reject (reject=true) only floor plans, maps, screenshots, logos, and collages.
+Multiple wide angles of the same room are intentional — keep reject=false for each. Only set duplicate_of when two images are nearly pixel-identical; different camera positions of one room are NOT duplicates.
 quality is 0-1: prefer wide, well-lit, straight-on interior/exterior photos.
 Return JSON only.`;
 
 function transitionVisionPrompt(fromLabel: string, toLabel: string): string {
+  const sameRoom = fromLabel === toLabel;
+  const roomContext = sameRoom
+    ? `Both frames are the SAME room (${fromLabel}) from different camera positions. Do NOT plan a walk into another space.`
+    : `Image START is ${fromLabel}. Image END is ${toLabel}. Plan a move only through architecture visible in START.`;
+
   return `You are a cinematographer planning a seamless image-to-image video morph for a real-estate walkthrough.
 
-Image START is the opening frame (${fromLabel}).
-Image END is the closing frame (${toLabel}).
+${roomContext}
 
 Study both photos carefully:
-- Identify shared architecture: doorways, hallways, floors, walls, windows, sightlines
-- Determine if END is visible from START (through a door, down a hall, around a corner)
-- Choose a camera move that exists in the actual space — never invent doors, windows, or rooms
+- Identify shared architecture: floors, walls, windows, furniture, sightlines
+- ${sameRoom ? "Choose an in-room orbit, pan, or lateral dolly — the camera never leaves the visible volume and never passes through walls." : "Determine if END is visible from START through a real doorway or hallway already in frame"}
+- Never invent doors, windows, hallways, or rooms that are not visible in START
 
 Return JSON only:
 {
   "connection_score": 0.0,
-  "shared_elements": ["list visible elements that appear in both frames"],
-  "camera_path": "one sentence describing the exact camera move through visible space",
-  "avoid": ["things the video model must not hallucinate"],
+  "shared_elements": ["elements visible in both frames"],
+  "camera_path": "one sentence describing the exact in-room or through-opening camera move",
+  "avoid": ["hallucinated doorways", "walking through walls", "invented rooms"],
   "higgsfield_prompt": "complete prompt for the video model"
 }
 
 Rules for higgsfield_prompt:
 - Must begin with: "${CINEMATIC_PROMPT_PREFIX}"
 - Opening frame must match START exactly; closing frame must match END exactly
-- Describe ONLY motion through architecture visible in START toward what appears in END
-- If a real doorway/opening connects the spaces, use it; if not, use a slow pan or dolly that stays inside START while gradually matching END lighting and geometry
+- ${sameRoom ? "Describe ONLY a slow orbit, pan, or lateral move inside the same room. Forbidden: forward walk, passing through walls, new doorways, morphing layout." : "Describe ONLY motion through openings already visible in START toward END. If no real opening connects them, use a slow pan/dolly that stays inside START geometry."}
 - Never say "walk through a door" unless that exact opening is visible in START
+- Explicitly forbid: passing through walls, inventing hallways, adding furniture, morphing walls
 - No people, no text overlays, stable walls and furniture
 - Keep higgsfield_prompt under 450 characters`;
 }
@@ -363,17 +367,9 @@ export async function curateTourPhotos(tourId: string) {
         ? tag.room_type
         : inferRoomFromFilename(photo.original_filename ?? "");
     const quality = tag?.quality ?? 0.5;
-    const rejected =
-      Boolean(tag?.reject) ||
-      roomType === "floorplan" ||
-      tag?.duplicate_of != null;
+    const rejected = Boolean(tag?.reject) || roomType === "floorplan";
     const rejectReason =
-      tag?.reject_reason ??
-      (roomType === "floorplan"
-        ? "floorplan"
-        : tag?.duplicate_of != null
-          ? "duplicate"
-          : null);
+      tag?.reject_reason ?? (roomType === "floorplan" ? "floorplan" : null);
 
     if (!rejected) {
       const current = bestByRoom.get(roomType);
@@ -408,9 +404,7 @@ export async function curateTourPhotos(tourId: string) {
 
     record.photos.sort((a, b) => {
       if (a.rejected !== b.rejected) return a.rejected ? 1 : -1;
-      const rank = walkthroughRank(a.room_type) - walkthroughRank(b.room_type);
-      if (rank !== 0) return rank;
-      return (b.quality_score ?? 0) - (a.quality_score ?? 0);
+      return a.sort_order - b.sort_order;
     });
     record.photos.forEach((photo, index) => {
       photo.sort_order = index;
