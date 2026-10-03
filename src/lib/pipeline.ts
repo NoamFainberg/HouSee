@@ -72,43 +72,32 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
         updated_at: now,
       });
     } else {
-      let clipIndex = 0;
-      for (let index = 0; index < photos.length; index += 1) {
-        const current = photos[index]!;
-        const next = photos[index + 1];
-        if (next && current.room_type !== next.room_type) {
-          clips.push({
-            id: crypto.randomUUID(),
-            tour_id: tourId,
-            photo_id: current.id,
-            end_photo_id: next.id,
-            room_type: current.room_type,
-            sort_order: clipIndex,
-            status: "pending",
-            prompt: transitionPrompt(current.room_type, next.room_type),
-            camera_move: "walkthrough_link",
-            higgsfield_request_id: null,
-            video_path: null,
-            video_url: null,
-            error: null,
-            created_at: now,
-            updated_at: now,
-          });
-          clipIndex += 1;
-          continue;
-        }
+      const plan = record.walkthrough_plan;
+      const ordered = plan?.photo_sequence.length
+        ? plan.photo_sequence
+            .map((id) => photos.find((photo) => photo.id === id))
+            .filter((photo): photo is Photo => Boolean(photo))
+        : photos;
 
-        const preset = CAMERA_PRESETS[current.room_type];
+      for (let index = 0; index < ordered.length - 1; index += 1) {
+        const start = ordered[index]!;
+        const end = ordered[index + 1]!;
+        const edge = plan?.transitions.find(
+          (item) =>
+            item.from_photo_id === start.id && item.to_photo_id === end.id,
+        );
         clips.push({
           id: crypto.randomUUID(),
           tour_id: tourId,
-          photo_id: current.id,
-          end_photo_id: null,
-          room_type: current.room_type,
-          sort_order: clipIndex,
+          photo_id: start.id,
+          end_photo_id: end.id,
+          room_type: start.room_type,
+          sort_order: index,
           status: "pending",
-          prompt: preset.prompt,
-          camera_move: preset.move,
+          prompt:
+            edge?.higgsfield_prompt ??
+            transitionPrompt(start.room_type, end.room_type),
+          camera_move: edge?.can_blend === false ? "hard_cut" : "spatial_blend",
           higgsfield_request_id: null,
           video_path: null,
           video_url: null,
@@ -116,7 +105,6 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
           created_at: now,
           updated_at: now,
         });
-        clipIndex += 1;
       }
     }
 
@@ -344,7 +332,11 @@ export async function runTourPipeline(
     const pendingClips = refreshedClips.filter(
       (clip) => clip.status !== "completed",
     );
-    const concurrency = generationConcurrency();
+    const tourRecord = await readTourRecord(tourId);
+    const concurrency =
+      tourRecord.walkthrough_plan?.transitions.length && !options?.resume
+        ? 1
+        : generationConcurrency();
     const uploadCache = photoUploadCache();
 
     if (pendingClips.length > 0) {

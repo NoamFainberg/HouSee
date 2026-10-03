@@ -40,45 +40,6 @@ async function titlePng(title: string): Promise<Buffer> {
   return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
-async function probeDuration(path: string): Promise<number> {
-  const probe = await execFileAsync("ffprobe", [
-    "-v",
-    "error",
-    "-show_entries",
-    "format=duration",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
-    path,
-  ]);
-  const parsed = Number(probe.stdout.trim());
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : clipDurationSeconds();
-}
-
-function xfadeFilter(durations: number[], fade: number) {
-  const clipCount = durations.length;
-  const scaled: string[] = [];
-  for (let i = 0; i < clipCount; i += 1) {
-    scaled.push(
-      `[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
-    );
-  }
-  if (clipCount === 1) {
-    return `${scaled.join(";")};[v0]copy[vout]`;
-  }
-  const fades: string[] = [];
-  let last = "v0";
-  let offset = Math.max(0, durations[0]! - fade);
-  for (let i = 1; i < clipCount; i += 1) {
-    const next = i === clipCount - 1 ? "vout" : `x${i}`;
-    fades.push(
-      `[${last}][v${i}]xfade=transition=fade:duration=${fade}:offset=${offset.toFixed(2)}[${next}]`,
-    );
-    last = next;
-    offset += Math.max(0, durations[i]! - fade);
-  }
-  return `${scaled.join(";")};${fades.join(";")}`;
-}
-
 export async function stitchTour(tourId: string): Promise<string> {
   await assertFfmpeg();
   const record = await readTourRecord(tourId);
@@ -158,9 +119,6 @@ export async function stitchTour(tourId: string): Promise<string> {
     ]);
 
     const allVideos = [titleVideo, ...clipPaths];
-    const segmentDurations = await Promise.all(
-      allVideos.map((path) => probeDuration(path)),
-    );
     const concatList = join(work, "concat.txt");
     await writeFile(
       concatList,
@@ -168,44 +126,23 @@ export async function stitchTour(tourId: string): Promise<string> {
     );
 
     const body = join(work, "body.mp4");
-    const fade = 0.15;
-    const args = ["-y"];
-    for (const path of allVideos) {
-      args.push("-i", path);
-    }
-    args.push(
-      "-filter_complex",
-      xfadeFilter(segmentDurations, fade),
-      "-map",
-      "[vout]",
-      "-an",
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      concatList,
       "-c:v",
       "libx264",
       "-pix_fmt",
       "yuv420p",
+      "-r",
+      "30",
+      "-an",
       body,
-    );
-    try {
-      await execFileAsync("ffmpeg", args);
-    } catch {
-      await execFileAsync("ffmpeg", [
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concatList,
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        "30",
-        "-an",
-        body,
-      ]);
-    }
+    ]);
 
     const probe = await execFileAsync("ffprobe", [
       "-v",

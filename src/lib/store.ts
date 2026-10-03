@@ -2,10 +2,30 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Clip, Photo, Tour, TourDetail } from "./types";
 
+export type WalkthroughTransitionPlan = {
+  from_photo_id: string;
+  to_photo_id: string;
+  connection_score: number;
+  spatial_relationship: string;
+  shared_elements: string[];
+  camera_path: string;
+  can_blend: boolean;
+  avoid: string[];
+  higgsfield_prompt: string;
+};
+
+export type WalkthroughPlan = {
+  scene_summary: string;
+  photo_sequence: string[];
+  transitions: WalkthroughTransitionPlan[];
+  analyzed_at: string;
+};
+
 export type TourRecord = {
   tour: Tour;
   photos: Photo[];
   clips: Clip[];
+  walkthrough_plan?: WalkthroughPlan;
 };
 
 const DATA_ROOT = path.join(process.cwd(), "data", "tours");
