@@ -4,15 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
-import { clipDurationSeconds } from "./env";
 import { absoluteMediaPath, readTourRecord, writeMasterBytes } from "./store";
 
 const execFileAsync = promisify(execFile);
 
-/** Skip the duplicate opening of morph clips that match the previous clip's landing frame. */
-const HANDOFF_SKIP_SEC = 0.45;
-/** Crossfade between consecutive morph segments for smoother seams. */
-const XFADE_SEC = 0.28;
+/** Skip duplicate static opening on clips that continue from the previous landing frame. */
+const HANDOFF_SKIP_SEC = 0.35;
+/** Hold the closing waypoint frame before cutting to the next morph. */
+const END_HOLD_SEC = 0.45;
 
 const SCALE_FILTER =
   "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1";
@@ -52,29 +51,37 @@ async function titlePng(title: string): Promise<Buffer> {
 }
 
 /**
- * Trim each Higgsfield morph so intermediate clips land on their end photo
- * (the next clip's opening frame) and later clips skip the duplicate hold.
+ * Prepare each Higgsfield morph for chained playback:
+ * - Clip 0 plays from the establish frame through the full morph (never fast-forwarded).
+ * - Intermediate clips hold the closing waypoint so the next clip can open on it.
+ * - Later clips skip the duplicate static opening that matches the previous hold.
  */
 async function normalizeMorphClip(
   inputPath: string,
   outputPath: string,
   index: number,
   total: number,
-  maxDuration: number,
 ): Promise<number> {
   const probed = await probeDurationSeconds(inputPath);
+  const isFirst = index === 0;
+  const isLast = index === total - 1;
+
   let startSec = 0;
-  if (index > 0) {
-    startSec = Math.min(HANDOFF_SKIP_SEC, probed * 0.08);
+  if (!isFirst) {
+    startSec = Math.min(HANDOFF_SKIP_SEC, Math.max(0, probed - 1) * 0.07);
   }
 
-  let takeSec = Math.min(maxDuration, Math.max(0.5, probed - startSec));
-
-  // Intermediate clips: align the segment ending on the closing (waypoint) frame.
-  if (index < total - 1 && probed - startSec > takeSec) {
-    startSec = Math.max(startSec, probed - takeSec);
-    takeSec = Math.min(maxDuration, probed - startSec);
+  // Opening morph: always from frame 0 through the full HF render.
+  let takeSec = Math.max(0.5, probed - startSec);
+  if (isFirst) {
+    startSec = 0;
+    takeSec = probed;
   }
+
+  const holdTail = !isLast ? END_HOLD_SEC : 0;
+  const vf = holdTail
+    ? `${SCALE_FILTER},tpad=stop_mode=clone:stop_duration=${holdTail}`
+    : SCALE_FILTER;
 
   await execFileAsync("ffmpeg", [
     "-y",
@@ -85,7 +92,7 @@ async function normalizeMorphClip(
     "-t",
     String(takeSec),
     "-vf",
-    SCALE_FILTER,
+    vf,
     "-an",
     "-c:v",
     "libx264",
@@ -99,42 +106,29 @@ async function normalizeMorphClip(
   return probeDurationSeconds(outputPath);
 }
 
-async function xfadeClipChain(
-  clipPaths: string[],
-  durations: number[],
-  outputPath: string,
-): Promise<void> {
+async function concatClips(clipPaths: string[], outputPath: string): Promise<void> {
   if (clipPaths.length === 0) {
-    throw new Error("No clips to crossfade");
+    throw new Error("No clips to concatenate");
   }
   if (clipPaths.length === 1) {
     await copyFile(clipPaths[0]!, outputPath);
     return;
   }
 
-  const args = ["-y"];
-  for (const path of clipPaths) {
-    args.push("-i", path);
-  }
+  const listPath = outputPath.replace(/\.mp4$/, "-list.txt");
+  await writeFile(
+    listPath,
+    clipPaths.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join("\n"),
+  );
 
-  let filter = "";
-  let offset = durations[0]! - XFADE_SEC;
-  let lastLabel = "0:v";
-
-  for (let index = 1; index < clipPaths.length; index += 1) {
-    const outLabel = index === clipPaths.length - 1 ? "vout" : `v${index}`;
-    filter += `[${lastLabel}][${index}:v]xfade=transition=fade:duration=${XFADE_SEC}:offset=${Math.max(0, offset).toFixed(3)}[${outLabel}];`;
-    lastLabel = outLabel;
-    if (index < clipPaths.length - 1) {
-      offset += durations[index]! - XFADE_SEC;
-    }
-  }
-
-  args.push(
-    "-filter_complex",
-    filter.slice(0, -1),
-    "-map",
-    "[vout]",
+  await execFileAsync("ffmpeg", [
+    "-y",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listPath,
     "-c:v",
     "libx264",
     "-pix_fmt",
@@ -143,9 +137,7 @@ async function xfadeClipChain(
     "30",
     "-an",
     outputPath,
-  );
-
-  await execFileAsync("ffmpeg", args);
+  ]);
 }
 
 export async function stitchTour(tourId: string): Promise<string> {
@@ -160,28 +152,24 @@ export async function stitchTour(tourId: string): Promise<string> {
   }
 
   const work = await mkdtemp(join(tmpdir(), "housee-"));
-  const maxClipDuration = clipDurationSeconds();
   try {
     const normalizedPaths: string[] = [];
-    const normalizedDurations: number[] = [];
 
     for (const [index, clip] of clips.entries()) {
       const rawPath = join(work, `raw-${index}.mp4`);
       const normalizedPath = join(work, `clip-${index}.mp4`);
       await copyFile(absoluteMediaPath(tourId, clip.video_path!), rawPath);
-      const duration = await normalizeMorphClip(
+      await normalizeMorphClip(
         rawPath,
         normalizedPath,
         index,
         clips.length,
-        maxClipDuration,
       );
       normalizedPaths.push(normalizedPath);
-      normalizedDurations.push(duration);
     }
 
     const morphBody = join(work, "morph-body.mp4");
-    await xfadeClipChain(normalizedPaths, normalizedDurations, morphBody);
+    await concatClips(normalizedPaths, morphBody);
 
     const titlePath = join(work, "title.png");
     const titleVideo = join(work, "title.mp4");
