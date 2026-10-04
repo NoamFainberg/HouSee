@@ -63,6 +63,7 @@ async function main() {
   console.log("Pipeline complete");
 
   const master = path.join(tourDir(tour.id), "master.mp4");
+  await mkdir(path.dirname(OUTPUT_ARTIFACT), { recursive: true });
   await copyFile(master, OUTPUT_ARTIFACT);
   console.log("Artifact:", OUTPUT_ARTIFACT);
   console.log("Tour ID:", tour.id);
