@@ -14,9 +14,15 @@ export type WalkthroughTransitionPlan = {
   higgsfield_prompt: string;
 };
 
+export type WalkthroughPhotoView = {
+  photo_id: string;
+  view_angle: string;
+};
+
 export type WalkthroughPlan = {
   scene_summary: string;
   photo_sequence: string[];
+  photo_views?: WalkthroughPhotoView[];
   transitions: WalkthroughTransitionPlan[];
   analyzed_at: string;
 };

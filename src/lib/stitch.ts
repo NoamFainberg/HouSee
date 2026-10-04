@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
 import { absoluteMediaPath, readTourRecord, writeMasterBytes } from "./store";
+import type { Clip } from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -50,35 +51,72 @@ async function titlePng(title: string): Promise<Buffer> {
   return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
+function isMorphClip(clip: Clip): boolean {
+  return clip.camera_move === "spatial_blend" && Boolean(clip.end_photo_id);
+}
+
+function shouldSkipMorphOpening(prev: Clip | undefined, current: Clip): boolean {
+  return Boolean(
+    prev &&
+      isMorphClip(prev) &&
+      isMorphClip(current) &&
+      prev.end_photo_id === current.photo_id,
+  );
+}
+
+function shouldHoldMorphEnd(current: Clip, next: Clip | undefined): boolean {
+  return Boolean(
+    isMorphClip(current) &&
+      next &&
+      isMorphClip(next) &&
+      next.photo_id === current.end_photo_id,
+  );
+}
+
+/** Ken Burns / static holds play at full authored duration. */
+async function normalizeHoldClip(
+  inputPath: string,
+  outputPath: string,
+): Promise<number> {
+  await execFileAsync("ffmpeg", [
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    SCALE_FILTER,
+    "-an",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-r",
+    "30",
+    outputPath,
+  ]);
+  return probeDurationSeconds(outputPath);
+}
+
 /**
- * Prepare each Higgsfield morph for chained playback:
- * - Clip 0 plays from the establish frame through the full morph (never fast-forwarded).
- * - Intermediate clips hold the closing waypoint so the next clip can open on it.
- * - Later clips skip the duplicate static opening that matches the previous hold.
+ * Prepare Higgsfield morphs for chained playback when adjacent morphs share a frame.
+ * Holds before/after morphs are separate clips — no skip or tail unless the next clip
+ * continues the same morph chain.
  */
 async function normalizeMorphClip(
   inputPath: string,
   outputPath: string,
-  index: number,
-  total: number,
+  prev: Clip | undefined,
+  current: Clip,
+  next: Clip | undefined,
 ): Promise<number> {
   const probed = await probeDurationSeconds(inputPath);
-  const isFirst = index === 0;
-  const isLast = index === total - 1;
-
+  const skipOpening = shouldSkipMorphOpening(prev, current);
   let startSec = 0;
-  if (!isFirst) {
+  if (skipOpening) {
     startSec = Math.min(HANDOFF_SKIP_SEC, Math.max(0, probed - 1) * 0.07);
   }
 
-  // Opening morph: always from frame 0 through the full HF render.
-  let takeSec = Math.max(0.5, probed - startSec);
-  if (isFirst) {
-    startSec = 0;
-    takeSec = probed;
-  }
-
-  const holdTail = !isLast ? END_HOLD_SEC : 0;
+  const holdTail = shouldHoldMorphEnd(current, next) ? END_HOLD_SEC : 0;
+  const takeSec = Math.max(0.5, probed - startSec);
   const vf = holdTail
     ? `${SCALE_FILTER},tpad=stop_mode=clone:stop_duration=${holdTail}`
     : SCALE_FILTER;
@@ -159,12 +197,17 @@ export async function stitchTour(tourId: string): Promise<string> {
       const rawPath = join(work, `raw-${index}.mp4`);
       const normalizedPath = join(work, `clip-${index}.mp4`);
       await copyFile(absoluteMediaPath(tourId, clip.video_path!), rawPath);
-      await normalizeMorphClip(
-        rawPath,
-        normalizedPath,
-        index,
-        clips.length,
-      );
+      if (clip.camera_move === "photo_hold") {
+        await normalizeHoldClip(rawPath, normalizedPath);
+      } else {
+        await normalizeMorphClip(
+          rawPath,
+          normalizedPath,
+          clips[index - 1],
+          clip,
+          clips[index + 1],
+        );
+      }
       normalizedPaths.push(normalizedPath);
     }
 

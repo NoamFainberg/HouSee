@@ -12,10 +12,16 @@ import {
   uploadToHiggsfield,
 } from "./higgsfield";
 import { stitchTour } from "./stitch";
+import { generatePhotoHoldClip } from "./hold";
 import {
   enrichClipPrompt,
   enrichTransitionPrompts,
+  sameRoomSet,
 } from "./vision";
+import {
+  planSameRoomSegments,
+  type PhotoViewMeta,
+} from "./walkthrough-clips";
 import {
   mutateTour,
   readPhotoBytes,
@@ -80,39 +86,94 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
         : photos;
 
       let clipIndex = 0;
+      const views = plan?.photo_views as PhotoViewMeta[] | undefined;
+      const useHoldMorphPlan =
+        sameRoomSet(ordered) &&
+        ordered.length >= 3 &&
+        Boolean(plan?.transitions.length);
 
-      // Chain one DoP morph per walk edge so each photo appears in sequence
-      // (e.g. TV wall → window wall → seating). Clip N ends on photo N+1, which
-      // is the opening frame of clip N+1 — no static hold, no hard jump.
-      const morphPairs = ordered
-        .slice(0, -1)
-        .map((start, index) => [start, ordered[index + 1]!] as const);
-
-      for (const [start, end] of morphPairs) {
-        const edge = plan?.transitions.find(
-          (item) =>
-            item.from_photo_id === start.id && item.to_photo_id === end.id,
+      if (useHoldMorphPlan) {
+        const segments = planSameRoomSegments(
+          ordered,
+          views,
+          plan!.transitions,
         );
-        clips.push({
-          id: crypto.randomUUID(),
-          tour_id: tourId,
-          photo_id: start.id,
-          end_photo_id: end.id,
-          room_type: start.room_type,
-          sort_order: clipIndex,
-          status: "pending",
-          prompt:
-            edge?.higgsfield_prompt ??
-            transitionPrompt(start.room_type, end.room_type),
-          camera_move: "spatial_blend",
-          higgsfield_request_id: null,
-          video_path: null,
-          video_url: null,
-          error: null,
-          created_at: now,
-          updated_at: now,
-        });
-        clipIndex += 1;
+        for (const segment of segments) {
+          if (segment.kind === "hold") {
+            clips.push({
+              id: crypto.randomUUID(),
+              tour_id: tourId,
+              photo_id: segment.photo.id,
+              end_photo_id: null,
+              room_type: segment.photo.room_type,
+              sort_order: clipIndex,
+              status: "pending",
+              prompt: null,
+              camera_move: "photo_hold",
+              hold_seconds: segment.seconds,
+              higgsfield_request_id: null,
+              video_path: null,
+              video_url: null,
+              error: null,
+              created_at: now,
+              updated_at: now,
+            });
+          } else {
+            clips.push({
+              id: crypto.randomUUID(),
+              tour_id: tourId,
+              photo_id: segment.start.id,
+              end_photo_id: segment.end.id,
+              room_type: segment.start.room_type,
+              sort_order: clipIndex,
+              status: "pending",
+              prompt:
+                segment.prompt ??
+                transitionPrompt(segment.start.room_type, segment.end.room_type),
+              camera_move: "spatial_blend",
+              hold_seconds: null,
+              higgsfield_request_id: null,
+              video_path: null,
+              video_url: null,
+              error: null,
+              created_at: now,
+              updated_at: now,
+            });
+          }
+          clipIndex += 1;
+        }
+      } else {
+        const morphPairs = ordered
+          .slice(0, -1)
+          .map((start, index) => [start, ordered[index + 1]!] as const);
+
+        for (const [start, end] of morphPairs) {
+          const edge = plan?.transitions.find(
+            (item) =>
+              item.from_photo_id === start.id && item.to_photo_id === end.id,
+          );
+          clips.push({
+            id: crypto.randomUUID(),
+            tour_id: tourId,
+            photo_id: start.id,
+            end_photo_id: end.id,
+            room_type: start.room_type,
+            sort_order: clipIndex,
+            status: "pending",
+            prompt:
+              edge?.higgsfield_prompt ??
+              transitionPrompt(start.room_type, end.room_type),
+            camera_move: "spatial_blend",
+            hold_seconds: null,
+            higgsfield_request_id: null,
+            video_path: null,
+            video_url: null,
+            error: null,
+            created_at: now,
+            updated_at: now,
+          });
+          clipIndex += 1;
+        }
       }
     }
 
@@ -212,6 +273,34 @@ export async function generateOneClip(
 
   const startPhoto = record.photos.find((photo) => photo.id === clip.photo_id);
   if (!startPhoto) throw new Error("Start photo not found");
+
+  if (clip.camera_move === "photo_hold") {
+    const holdLabel = ROOM_LABELS[(clip.room_type as RoomType) ?? startPhoto.room_type];
+    await touchTourProgress(
+      tourId,
+      clipId,
+      holdLabel,
+      `Rendering ${holdLabel} hold…`,
+    );
+    const storagePath = await generatePhotoHoldClip(
+      tourId,
+      clip.id,
+      startPhoto,
+      clip.hold_seconds ?? 2.5,
+      true,
+    );
+    await mutateTour(tourId, (current) => {
+      const target = current.clips.find((item) => item.id === clipId);
+      if (!target) return;
+      target.status = "completed";
+      target.video_path = storagePath;
+      target.video_url = null;
+      target.error = null;
+      target.updated_at = new Date().toISOString();
+      current.tour.updated_at = new Date().toISOString();
+    });
+    return;
+  }
 
   const endPhoto = clip.end_photo_id
     ? record.photos.find((photo) => photo.id === clip.end_photo_id)

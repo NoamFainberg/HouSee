@@ -543,11 +543,25 @@ export async function planWalkthroughSequence(
   return plan;
 }
 
-function sameRoomSet(photos: Photo[]): boolean {
+export function sameRoomSet(photos: Photo[]): boolean {
   return (
     photos.length >= 3 &&
     photos.every((photo) => photo.room_type === photos[0]!.room_type)
   );
+}
+
+function photoViewsFromRoles(
+  ordered: Photo[],
+  uploadOrdered: Photo[],
+  viewRoles: ViewAngleRole[],
+): WalkthroughPlan["photo_views"] {
+  return ordered.map((photo) => {
+    const uploadIndex = uploadOrdered.findIndex((item) => item.id === photo.id);
+    return {
+      photo_id: photo.id,
+      view_angle: viewRoles[uploadIndex] ?? "other",
+    };
+  });
 }
 
 function parseViewAngleRoles(
@@ -628,16 +642,18 @@ async function refineSameRoomWalkOrder(
   const viewRoles = await classifySameRoomViewAngles(uploadOrdered);
   const ordered = orderPhotosByViewAngles(uploadOrdered, viewRoles);
 
+  const photo_views = photoViewsFromRoles(ordered, uploadOrdered, viewRoles);
   const orderChanged = ordered.some(
     (photo, index) => photo.id !== plan.photo_sequence[index],
   );
   if (!orderChanged) {
-    return { ordered, plan };
+    return { ordered, plan: { ...plan, photo_views } };
   }
 
+  const rebuilt = await rebuildWalkthroughPlanForOrder(ordered, plan);
   return {
     ordered,
-    plan: await rebuildWalkthroughPlanForOrder(ordered, plan),
+    plan: { ...rebuilt, photo_views },
   };
 }
 
@@ -681,6 +697,7 @@ export async function rebuildWalkthroughPlanForOrder(
   return {
     scene_summary: existing?.scene_summary ?? "",
     photo_sequence: photos.map((photo) => photo.id),
+    photo_views: existing?.photo_views,
     transitions,
     analyzed_at: new Date().toISOString(),
   };
