@@ -11,6 +11,7 @@ import {
   submitWalkthroughGeneration,
   uploadToHiggsfield,
 } from "./higgsfield";
+import { generatePhotoHoldClip } from "./hold";
 import { stitchTour } from "./stitch";
 import {
   enrichClipPrompt,
@@ -72,19 +73,29 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
         updated_at: now,
       });
     } else {
-      for (let index = 0; index < photos.length - 1; index += 1) {
-        const start = photos[index]!;
-        const end = photos[index + 1]!;
+      const plan = record.walkthrough_plan;
+      const ordered = plan?.photo_sequence.length
+        ? plan.photo_sequence
+            .map((id) => photos.find((photo) => photo.id === id))
+            .filter((photo): photo is Photo => Boolean(photo))
+        : photos;
+
+      const sameRoom =
+        ordered.length >= 3 &&
+        ordered.every((photo) => photo.room_type === ordered[0]!.room_type);
+      let clipIndex = 0;
+
+      if (sameRoom) {
         clips.push({
           id: crypto.randomUUID(),
           tour_id: tourId,
-          photo_id: start.id,
-          end_photo_id: end.id,
-          room_type: start.room_type,
-          sort_order: index,
+          photo_id: ordered[0]!.id,
+          end_photo_id: null,
+          room_type: ordered[0]!.room_type,
+          sort_order: clipIndex,
           status: "pending",
-          prompt: transitionPrompt(start.room_type, end.room_type),
-          camera_move: "walkthrough_link",
+          prompt: null,
+          camera_move: "hold",
           higgsfield_request_id: null,
           video_path: null,
           video_url: null,
@@ -92,6 +103,37 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
           created_at: now,
           updated_at: now,
         });
+        clipIndex += 1;
+      }
+
+      const morphStart = sameRoom ? 1 : 0;
+      for (let index = morphStart; index < ordered.length - 1; index += 1) {
+        const start = ordered[index]!;
+        const end = ordered[index + 1]!;
+        const edge = plan?.transitions.find(
+          (item) =>
+            item.from_photo_id === start.id && item.to_photo_id === end.id,
+        );
+        clips.push({
+          id: crypto.randomUUID(),
+          tour_id: tourId,
+          photo_id: start.id,
+          end_photo_id: end.id,
+          room_type: start.room_type,
+          sort_order: clipIndex,
+          status: "pending",
+          prompt:
+            edge?.higgsfield_prompt ??
+            transitionPrompt(start.room_type, end.room_type),
+          camera_move: "spatial_blend",
+          higgsfield_request_id: null,
+          video_path: null,
+          video_url: null,
+          error: null,
+          created_at: now,
+          updated_at: now,
+        });
+        clipIndex += 1;
       }
     }
 
@@ -191,6 +233,33 @@ export async function generateOneClip(
 
   const startPhoto = record.photos.find((photo) => photo.id === clip.photo_id);
   if (!startPhoto) throw new Error("Start photo not found");
+
+  if (clip.camera_move === "hold") {
+    await mutateTour(tourId, (current) => {
+      current.tour.progress_label = "Rendering opening still…";
+      current.tour.updated_at = new Date().toISOString();
+      const target = current.clips.find((item) => item.id === clipId);
+      if (!target) return;
+      target.status = "submitted";
+      target.updated_at = new Date().toISOString();
+    });
+    const storagePath = await generatePhotoHoldClip(
+      tourId,
+      clip.id,
+      startPhoto,
+    );
+    await mutateTour(tourId, (current) => {
+      const target = current.clips.find((item) => item.id === clipId);
+      if (!target) return;
+      target.status = "completed";
+      target.video_path = storagePath;
+      target.error = null;
+      target.updated_at = new Date().toISOString();
+      current.tour.updated_at = new Date().toISOString();
+    });
+    return;
+  }
+
   const endPhoto = clip.end_photo_id
     ? record.photos.find((photo) => photo.id === clip.end_photo_id)
     : undefined;
@@ -319,7 +388,11 @@ export async function runTourPipeline(
     const pendingClips = refreshedClips.filter(
       (clip) => clip.status !== "completed",
     );
-    const concurrency = generationConcurrency();
+    const tourRecord = await readTourRecord(tourId);
+    const concurrency =
+      tourRecord.walkthrough_plan?.transitions.length && !options?.resume
+        ? 1
+        : generationConcurrency();
     const uploadCache = photoUploadCache();
 
     if (pendingClips.length > 0) {

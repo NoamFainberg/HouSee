@@ -33,6 +33,14 @@ export function videoModel(): string {
   );
 }
 
+export function heroModel(): string {
+  return process.env.HF_HERO_MODEL ?? transitionModel();
+}
+
+export function visionPlanningModel(): string {
+  return process.env.OPENAI_VISION_MODEL ?? "gpt-4o";
+}
+
 export function transitionModel(): string {
   return (
     process.env.HF_TRANSITION_MODEL ?? "higgsfield-ai/dop/turbo"

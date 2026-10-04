@@ -4,10 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
-import { clipLabel, ROOM_LABELS } from "./rooms";
 import { clipDurationSeconds } from "./env";
 import { absoluteMediaPath, readTourRecord, writeMasterBytes } from "./store";
-import type { RoomType } from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,15 +19,6 @@ async function assertFfmpeg() {
   }
 }
 
-async function overlayPng(label: string): Promise<Buffer> {
-  const safe = label.replace(/[<>&]/g, "");
-  const svg = `<svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg">
-    <rect x="72" y="948" rx="12" ry="12" width="${Math.min(720, 80 + safe.length * 18)}" height="64" fill="rgba(18,14,10,0.55)"/>
-    <text x="96" y="992" font-family="Georgia, 'Times New Roman', serif" font-size="32" fill="#F6EFE4">${safe}</text>
-  </svg>`;
-  return sharp(Buffer.from(svg)).png().toBuffer();
-}
-
 async function titlePng(title: string): Promise<Buffer> {
   const safe = title.replace(/[<>&]/g, "");
   const svg = `<svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg">
@@ -38,30 +27,6 @@ async function titlePng(title: string): Promise<Buffer> {
     <text x="160" y="580" font-family="Georgia, 'Times New Roman', serif" font-size="28" fill="#C4A574">House tour</text>
   </svg>`;
   return sharp(Buffer.from(svg)).png().toBuffer();
-}
-
-function xfadeFilter(clipCount: number, clipDuration: number, fade: number) {
-  const scaled: string[] = [];
-  for (let i = 0; i < clipCount; i += 1) {
-    scaled.push(
-      `[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
-    );
-  }
-  if (clipCount === 1) {
-    return `${scaled.join(";")};[v0]copy[vout]`;
-  }
-  const fades: string[] = [];
-  let last = "v0";
-  let offset = clipDuration - fade;
-  for (let i = 1; i < clipCount; i += 1) {
-    const next = i === clipCount - 1 ? "vout" : `x${i}`;
-    fades.push(
-      `[${last}][v${i}]xfade=transition=fade:duration=${fade}:offset=${offset.toFixed(2)}[${next}]`,
-    );
-    last = next;
-    offset += clipDuration - fade;
-  }
-  return `${scaled.join(";")};${fades.join(";")}`;
 }
 
 export async function stitchTour(tourId: string): Promise<string> {
@@ -81,35 +46,16 @@ export async function stitchTour(tourId: string): Promise<string> {
     const clipPaths: string[] = [];
     for (const [index, clip] of clips.entries()) {
       const rawPath = join(work, `raw-${index}.mp4`);
-      const labeledPath = join(work, `clip-${index}.mp4`);
+      const normalizedPath = join(work, `clip-${index}.mp4`);
       await copyFile(absoluteMediaPath(tourId, clip.video_path!), rawPath);
-      const endPhoto = clip.end_photo_id
-        ? record.photos.find((photo) => photo.id === clip.end_photo_id)
-        : undefined;
-      const overlayPath = join(work, `overlay-${index}.png`);
-      await writeFile(
-        overlayPath,
-        await overlayPng(
-          endPhoto
-            ? clipLabel(
-                (clip.room_type as RoomType) ?? "other",
-                endPhoto.room_type,
-              )
-            : ROOM_LABELS[(clip.room_type as RoomType) ?? "other"] ?? "Room",
-        ),
-      );
       await execFileAsync("ffmpeg", [
         "-y",
         "-i",
         rawPath,
         "-t",
         String(clipDuration),
-        "-i",
-        overlayPath,
-        "-filter_complex",
-        "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[base];[base][1:v]overlay=0:0:enable='between(t,0,2.3)'[v]",
-        "-map",
-        "[v]",
+        "-vf",
+        "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1",
         "-an",
         "-c:v",
         "libx264",
@@ -117,9 +63,9 @@ export async function stitchTour(tourId: string): Promise<string> {
         "yuv420p",
         "-r",
         "30",
-        labeledPath,
+        normalizedPath,
       ]);
-      clipPaths.push(labeledPath);
+      clipPaths.push(normalizedPath);
     }
 
     const titlePath = join(work, "title.png");
@@ -150,44 +96,23 @@ export async function stitchTour(tourId: string): Promise<string> {
     );
 
     const body = join(work, "body.mp4");
-    const fade = 0.15;
-    const args = ["-y"];
-    for (const path of allVideos) {
-      args.push("-i", path);
-    }
-    args.push(
-      "-filter_complex",
-      xfadeFilter(allVideos.length, clipDuration, fade),
-      "-map",
-      "[vout]",
-      "-an",
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      concatList,
       "-c:v",
       "libx264",
       "-pix_fmt",
       "yuv420p",
+      "-r",
+      "30",
+      "-an",
       body,
-    );
-    try {
-      await execFileAsync("ffmpeg", args);
-    } catch {
-      await execFileAsync("ffmpeg", [
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concatList,
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        "30",
-        "-an",
-        body,
-      ]);
-    }
+    ]);
 
     const probe = await execFileAsync("ffprobe", [
       "-v",
