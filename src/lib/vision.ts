@@ -4,6 +4,7 @@ import {
   inferRoomFromFilename,
   inferSameRoomViewRole,
   isRoomType,
+  orderSameRoomWalkPhotos,
   ROOM_LABELS,
   transitionPrompt,
 } from "./rooms";
@@ -86,7 +87,7 @@ Return JSON only:
 }
 
 CRITICAL RULES:
-- sequence[0] MUST be the entry / establish photo — the first view a visitor sees when walking in
+- sequence[0] MUST be the entry / establish photo — widest layout view or main feature wall (NOT a tight sofa close-up)
 - sequence must list every non-rejected photo index exactly once (${photoCount} indices total, 0-based)
 - can_blend=true ONLY when shared_elements are genuinely visible in BOTH frames and a real in-room camera move connects them
 - higgsfield_prompt MUST begin with: "${CINEMATIC_PROMPT_PREFIX}"
@@ -510,6 +511,68 @@ export async function planWalkthroughSequence(
   return plan;
 }
 
+function sameRoomSet(photos: Photo[]): boolean {
+  return (
+    photos.length >= 3 &&
+    photos.every((photo) => photo.room_type === photos[0]!.room_type)
+  );
+}
+
+/** Prefer establish / widest shot first so the tour opens like walking in. */
+async function refineSameRoomWalkOrder(
+  photos: Photo[],
+  plan: WalkthroughPlan,
+): Promise<{ ordered: Photo[]; plan: WalkthroughPlan }> {
+  if (!sameRoomSet(photos)) {
+    const byId = new Map(photos.map((photo) => [photo.id, photo]));
+    const ordered = plan.photo_sequence
+      .map((id) => byId.get(id))
+      .filter((photo): photo is Photo => Boolean(photo));
+    return { ordered: ordered.length === photos.length ? ordered : photos, plan };
+  }
+
+  const byId = new Map(photos.map((photo) => [photo.id, photo]));
+  let ordered = plan.photo_sequence
+    .map((id) => byId.get(id))
+    .filter((photo): photo is Photo => Boolean(photo));
+  if (ordered.length !== photos.length) {
+    ordered = [...photos].sort((a, b) => a.sort_order - b.sort_order);
+  }
+
+  const roleOrdered = orderSameRoomWalkPhotos(ordered);
+  const rolesFound = roleOrdered.some(
+    (photo) => inferSameRoomViewRole(photo.original_filename ?? "") !== null,
+  );
+  if (rolesFound) {
+    ordered = roleOrdered;
+  } else {
+    const hero = [...ordered].sort(
+      (a, b) => b.quality_score - a.quality_score,
+    )[0];
+    if (hero) {
+      const heroIndex = ordered.findIndex((photo) => photo.id === hero.id);
+      if (heroIndex > 0) {
+        ordered = [
+          ...ordered.slice(heroIndex),
+          ...ordered.slice(0, heroIndex),
+        ];
+      }
+    }
+  }
+
+  const orderChanged = ordered.some(
+    (photo, index) => photo.id !== plan.photo_sequence[index],
+  );
+  if (!orderChanged) {
+    return { ordered, plan };
+  }
+
+  return {
+    ordered,
+    plan: await rebuildWalkthroughPlanForOrder(ordered, plan),
+  };
+}
+
 export async function rebuildWalkthroughPlanForOrder(
   photos: Photo[],
   existing?: WalkthroughPlan,
@@ -827,14 +890,11 @@ export async function curateTourPhotos(tourId: string) {
       const uploadOrdered = [...included].sort(
         (a, b) => a.sort_order - b.sort_order,
       );
-      const plan = await planWalkthroughSequence(uploadOrdered);
-      const byId = new Map(uploadOrdered.map((photo) => [photo.id, photo]));
-      let sequenced = plan.photo_sequence
-        .map((id) => byId.get(id))
-        .filter((photo): photo is Photo => Boolean(photo));
-      if (sequenced.length !== uploadOrdered.length) {
-        sequenced = uploadOrdered;
-      }
+      const initialPlan = await planWalkthroughSequence(uploadOrdered);
+      const { ordered: sequenced, plan } = await refineSameRoomWalkOrder(
+        uploadOrdered,
+        initialPlan,
+      );
       const rejected = record.photos.filter((photo) => photo.rejected);
       record.photos = [...sequenced, ...rejected];
       record.photos.forEach((photo, index) => {
