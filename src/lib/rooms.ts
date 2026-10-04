@@ -1,4 +1,4 @@
-import type { RoomType } from "./types";
+import type { Photo, RoomType } from "./types";
 
 export const WALKTHROUGH_ORDER: RoomType[] = [
   "exterior",
@@ -98,6 +98,31 @@ export function walkthroughRank(room: RoomType): number {
 
 export function isRoomType(value: string): value is RoomType {
   return (WALKTHROUGH_ORDER as string[]).includes(value);
+}
+
+export type SameRoomViewRole = "establish" | "feature" | "detail";
+
+export function inferSameRoomViewRole(filename: string): SameRoomViewRole | null {
+  const n = filename.toLowerCase();
+  if (/tv|01-living|establish|hero|wide/.test(n)) return "establish";
+  if (/window|02-living|curtain|drape/.test(n)) return "feature";
+  if (/seating|sofa|03-living|lounge/.test(n)) return "detail";
+  return null;
+}
+
+export function orderSameRoomWalkPhotos(photos: Photo[]): Photo[] {
+  if (photos.length < 3) return photos;
+  const roles = photos.map((photo) => ({
+    photo,
+    role: inferSameRoomViewRole(photo.original_filename ?? ""),
+  }));
+  const establish = roles.find((item) => item.role === "establish");
+  const feature = roles.find((item) => item.role === "feature");
+  const detail = roles.find((item) => item.role === "detail");
+  if (establish && feature && detail) {
+    return [establish.photo, feature.photo, detail.photo];
+  }
+  return [...photos].sort((a, b) => a.sort_order - b.sort_order);
 }
 
 export function inferRoomFromFilename(filename: string): RoomType {

@@ -11,7 +11,6 @@ import {
   submitWalkthroughGeneration,
   uploadToHiggsfield,
 } from "./higgsfield";
-import { generatePhotoHoldClip } from "./hold";
 import { stitchTour } from "./stitch";
 import {
   enrichClipPrompt,
@@ -85,31 +84,16 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
         ordered.every((photo) => photo.room_type === ordered[0]!.room_type);
       let clipIndex = 0;
 
-      if (sameRoom) {
-        clips.push({
-          id: crypto.randomUUID(),
-          tour_id: tourId,
-          photo_id: ordered[0]!.id,
-          end_photo_id: null,
-          room_type: ordered[0]!.room_type,
-          sort_order: clipIndex,
-          status: "pending",
-          prompt: null,
-          camera_move: "hold",
-          higgsfield_request_id: null,
-          video_path: null,
-          video_url: null,
-          error: null,
-          created_at: now,
-          updated_at: now,
-        });
-        clipIndex += 1;
-      }
+      // Same-room multi-angle: skip the wide establish→next morph (often passes
+      // through walls) and generate one continuous DoP morph on the final edge
+      // (e.g. window wall → seating) so the tour is a single seamless transition.
+      const morphPairs = sameRoom
+        ? [[ordered[ordered.length - 2]!, ordered[ordered.length - 1]!] as const]
+        : ordered
+            .slice(0, -1)
+            .map((start, index) => [start, ordered[index + 1]!] as const);
 
-      const morphStart = sameRoom ? 1 : 0;
-      for (let index = morphStart; index < ordered.length - 1; index += 1) {
-        const start = ordered[index]!;
-        const end = ordered[index + 1]!;
+      for (const [start, end] of morphPairs) {
         const edge = plan?.transitions.find(
           (item) =>
             item.from_photo_id === start.id && item.to_photo_id === end.id,
@@ -233,32 +217,6 @@ export async function generateOneClip(
 
   const startPhoto = record.photos.find((photo) => photo.id === clip.photo_id);
   if (!startPhoto) throw new Error("Start photo not found");
-
-  if (clip.camera_move === "hold") {
-    await mutateTour(tourId, (current) => {
-      current.tour.progress_label = "Rendering opening still…";
-      current.tour.updated_at = new Date().toISOString();
-      const target = current.clips.find((item) => item.id === clipId);
-      if (!target) return;
-      target.status = "submitted";
-      target.updated_at = new Date().toISOString();
-    });
-    const storagePath = await generatePhotoHoldClip(
-      tourId,
-      clip.id,
-      startPhoto,
-    );
-    await mutateTour(tourId, (current) => {
-      const target = current.clips.find((item) => item.id === clipId);
-      if (!target) return;
-      target.status = "completed";
-      target.video_path = storagePath;
-      target.error = null;
-      target.updated_at = new Date().toISOString();
-      current.tour.updated_at = new Date().toISOString();
-    });
-    return;
-  }
 
   const endPhoto = clip.end_photo_id
     ? record.photos.find((photo) => photo.id === clip.end_photo_id)

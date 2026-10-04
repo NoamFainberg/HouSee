@@ -3,6 +3,7 @@ import {
   CINEMATIC_PROMPT_PREFIX,
   inferRoomFromFilename,
   isRoomType,
+  orderSameRoomWalkPhotos,
   ROOM_LABELS,
   transitionPrompt,
 } from "./rooms";
@@ -502,6 +503,51 @@ export async function planWalkthroughSequence(
   return plan;
 }
 
+export async function rebuildWalkthroughPlanForOrder(
+  photos: Photo[],
+  existing?: WalkthroughPlan,
+): Promise<WalkthroughPlan> {
+  const transitions: WalkthroughTransitionPlan[] = [];
+  for (let index = 0; index < photos.length - 1; index += 1) {
+    const start = photos[index]!;
+    const end = photos[index + 1]!;
+    const existingEdge = existing?.transitions.find(
+      (item) =>
+        item.from_photo_id === start.id && item.to_photo_id === end.id,
+    );
+    if (existingEdge) {
+      transitions.push(existingEdge);
+      continue;
+    }
+    const pair = await planTransitionPair(start, end);
+    transitions.push(
+      tuneTransitionPrompt(
+        {
+          from_photo_id: start.id,
+          to_photo_id: end.id,
+          connection_score: pair.connection_score,
+          spatial_relationship: pair.camera_path,
+          shared_elements: pair.shared_elements,
+          camera_path: pair.camera_path,
+          can_blend: pair.connection_score >= 0.45,
+          avoid: ["invented doorways", "people", "cameras", "moving walls"],
+          higgsfield_prompt: pair.higgsfield_prompt,
+        },
+        index,
+        start,
+        end,
+      ),
+    );
+  }
+
+  return {
+    scene_summary: existing?.scene_summary ?? "",
+    photo_sequence: photos.map((photo) => photo.id),
+    transitions,
+    analyzed_at: new Date().toISOString(),
+  };
+}
+
 function parseTransitionPlan(raw: string, fallback: string): TransitionPlan {
   try {
     const match = raw.match(/\{[\s\S]*\}/);
@@ -771,11 +817,23 @@ export async function curateTourPhotos(tourId: string) {
     const included = record.photos.filter((photo) => !photo.rejected);
     if (included.length >= 2 && hasVisionEnv()) {
       record.tour.progress_label = "Mapping layout and sequencing photos…";
-      const plan = await planWalkthroughSequence(included);
-      const byId = new Map(record.photos.map((photo) => [photo.id, photo]));
-      const sequenced = plan.photo_sequence
-        .map((id) => byId.get(id))
-        .filter((photo): photo is Photo => Boolean(photo));
+      const uploadOrdered = [...included].sort(
+        (a, b) => a.sort_order - b.sort_order,
+      );
+      const sameRoomMulti =
+        uploadOrdered.length >= 3 &&
+        uploadOrdered.every(
+          (photo) => photo.room_type === uploadOrdered[0]!.room_type,
+        );
+      const initialPlan = await planWalkthroughSequence(uploadOrdered);
+      const sequenced = sameRoomMulti
+        ? orderSameRoomWalkPhotos(uploadOrdered)
+        : initialPlan.photo_sequence
+            .map((id) => uploadOrdered.find((photo) => photo.id === id))
+            .filter((photo): photo is Photo => Boolean(photo));
+      const plan = sameRoomMulti
+        ? await rebuildWalkthroughPlanForOrder(sequenced, initialPlan)
+        : initialPlan;
       const rejected = record.photos.filter((photo) => photo.rejected);
       record.photos = [...sequenced, ...rejected];
       record.photos.forEach((photo, index) => {
