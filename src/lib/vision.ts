@@ -2,6 +2,7 @@ import sharp from "sharp";
 import {
   CINEMATIC_PROMPT_PREFIX,
   inferRoomFromFilename,
+  inferSameRoomViewRole,
   isRoomType,
   orderSameRoomWalkPhotos,
   ROOM_LABELS,
@@ -125,18 +126,23 @@ export function tuneTransitionPrompt(
 ): WalkthroughTransitionPlan {
   const sameRoom = start.room_type === end.room_type;
   const degrees = parsePanDegrees(edge.camera_path);
+  const establishToNext =
+    inferSameRoomViewRole(start.original_filename ?? "") === "establish" &&
+    inferSameRoomViewRole(end.original_filename ?? "") === "feature";
   const needsConservative =
     sameRoom &&
-    (transitionIndex === 0 || (degrees !== null && degrees > 25));
+    (transitionIndex === 0 ||
+      establishToNext ||
+      (degrees !== null && degrees > 25));
 
   if (!needsConservative) {
     return edge;
   }
 
+  const maxPan = establishToNext ? 15 : 20;
   const avoid = [...new Set([...edge.avoid, ...CONSERVATIVE_MORPH_AVOID])];
-  const cameraPath =
-    "Locked tripod, yaw-only rotation, max 20-degree horizontal pan. Zero forward motion, zero lateral travel. All walls and door frames stay closed and fixed.";
-  const basePrompt = `${CINEMATIC_PROMPT_PREFIX} Morph from opening frame to closing frame inside the same room. ${edge.spatial_relationship || "Stay inside visible geometry."} Walls, door frames, and ceiling edges remain solid — only a slow horizontal turn on a locked tripod, never passing through walls or open doorways.`;
+  const cameraPath = `Locked tripod, yaw-only rotation, max ${maxPan}-degree horizontal pan. Zero forward motion, zero lateral travel. All walls and door frames stay closed and fixed.`;
+  const basePrompt = `${CINEMATIC_PROMPT_PREFIX} Morph from opening frame to closing frame inside the same room. ${edge.spatial_relationship || "Stay inside visible geometry."} Keep every wall, doorway, and corner exactly as photographed — rotate the camera in place only, never fly through solid surfaces or open new passages. Shared anchors (${edge.shared_elements.slice(0, 3).join(", ") || "ceiling, floor plane"}) stay fixed.`;
 
   return {
     ...edge,

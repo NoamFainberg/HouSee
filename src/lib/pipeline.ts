@@ -79,19 +79,14 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
             .filter((photo): photo is Photo => Boolean(photo))
         : photos;
 
-      const sameRoom =
-        ordered.length >= 3 &&
-        ordered.every((photo) => photo.room_type === ordered[0]!.room_type);
       let clipIndex = 0;
 
-      // Same-room multi-angle: skip the wide establish→next morph (often passes
-      // through walls) and generate one continuous DoP morph on the final edge
-      // (e.g. window wall → seating) so the tour is a single seamless transition.
-      const morphPairs = sameRoom
-        ? [[ordered[ordered.length - 2]!, ordered[ordered.length - 1]!] as const]
-        : ordered
-            .slice(0, -1)
-            .map((start, index) => [start, ordered[index + 1]!] as const);
+      // Chain one DoP morph per walk edge so each photo appears in sequence
+      // (e.g. TV wall → window wall → seating). Clip N ends on photo N+1, which
+      // is the opening frame of clip N+1 — no static hold, no hard jump.
+      const morphPairs = ordered
+        .slice(0, -1)
+        .map((start, index) => [start, ordered[index + 1]!] as const);
 
       for (const [start, end] of morphPairs) {
         const edge = plan?.transitions.find(
