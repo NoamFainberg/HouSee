@@ -4,7 +4,6 @@ import {
   inferRoomFromFilename,
   inferSameRoomViewRole,
   isRoomType,
-  orderSameRoomWalkPhotos,
   ROOM_LABELS,
   transitionPrompt,
 } from "./rooms";
@@ -48,15 +47,15 @@ quality is 0-1: prefer wide, well-lit, straight-on interior/exterior photos.
 Return JSON only.`;
 
 function walkthroughPlanPrompt(photoCount: number): string {
-  return `You are a cinematographer and spatial-reasoning planner for a real-estate walkthrough video.
+  return `You are a cinematographer planning a seamless real-estate walkthrough — as if a visitor entered the home and glided through it on one continuous tour path.
 
-You receive ${photoCount} photographs of the same property, possibly the same room from different positions. Study ALL images together before deciding anything.
+You receive ${photoCount} photographs of the same property (often the same room from different positions). Study ALL images together before deciding anything.
 
 Your tasks:
-1. Identify anchor elements that repeat across photos (floor material, ceiling lights, specific sofa, TV, window wall, etc.)
-2. Infer how the camera positions relate in real space (e.g. "photo 1 faces the TV wall; photo 2 is panned left toward the window")
-3. Order the photos into a walk sequence where each consecutive step could be filmed by a real camera move without passing through walls
-4. For each consecutive pair in that sequence, write the exact Higgsfield image-to-video morph prompt
+1. Map the room in your head: where would a visitor stand first? Which photo is the natural entry / establish shot?
+2. Order photos into a walk sequence a real person could follow — each step is ONE camera move to the next viewpoint, never teleporting
+3. For every consecutive pair, list shared_elements visible in BOTH frames (these lock geometry during morph and at stitch seams)
+4. Write Higgsfield morph prompts so clip N ends exactly on photo N+1, and clip N+1 opens on that same photo — the tour must cut seamlessly
 
 Return JSON only:
 {
@@ -87,17 +86,17 @@ Return JSON only:
 }
 
 CRITICAL RULES:
+- sequence[0] MUST be the entry / establish photo — the first view a visitor sees when walking in
 - sequence must list every non-rejected photo index exactly once (${photoCount} indices total, 0-based)
-- can_blend=true ONLY when shared_elements are genuinely visible in BOTH frames and a real camera move could connect them without hallucination
+- can_blend=true ONLY when shared_elements are genuinely visible in BOTH frames and a real in-room camera move connects them
 - higgsfield_prompt MUST begin with: "${CINEMATIC_PROMPT_PREFIX}"
-- Opening frame must match from_index exactly; closing frame must match to_index exactly
+- Opening frame must match from_index exactly; closing frame must match to_index exactly and HOLD on it — the next clip opens on that same frame
+- Each higgsfield_prompt MUST name shared_elements as fixed anchors and describe the exact in-room camera move (pan/orbit/dolly) between viewpoints
 - Motion stays inside visible geometry — NEVER pass through solid walls, NEVER add doorways/windows/people/cameras/tripods not in the start frame
-- Reference shared anchors by name so the model locks geometry
-- Forbidden words in higgsfield_prompt: "walk through door" unless that exact opening is visible in the start frame
-- If two views cannot connect without hallucination, set can_blend=false and explain why
+- If two views cannot connect without hallucination, set can_blend=false (and prefer reordering the walk to avoid that edge)
 - Keep each higgsfield_prompt under 420 characters
 - room_type must be one of: exterior, entry, living, kitchen, dining, bedroom, bathroom, balcony, view, amenity, other, floorplan
-- Same-room wide rotation (>25° between views): use locked tripod, yaw-only, max 20° pan — NEVER translate the camera through the room or pass through walls/door frames visible in START
+- Wide same-room rotations: locked tripod, yaw-only pan along the floor plane — never fly through walls or door frames
 - Name solid walls and door frames in START that must stay closed and fixed`;
 }
 
@@ -131,9 +130,10 @@ export function tuneTransitionPrompt(
     inferSameRoomViewRole(end.original_filename ?? "") === "feature";
   const needsConservative =
     sameRoom &&
-    (transitionIndex === 0 ||
+    (!edge.can_blend ||
+      edge.connection_score < 0.65 ||
       establishToNext ||
-      (degrees !== null && degrees > 25));
+      (degrees !== null && degrees > 30));
 
   if (!needsConservative) {
     return edge;
@@ -337,6 +337,7 @@ function finalizeHiggsfieldPrompt(
   if (avoid.length > 0) {
     next = `${next} Avoid: ${avoid.slice(0, 4).join(", ")}.`;
   }
+  next = `${next} End by holding the closing frame on shared anchors for a seamless cut to the next shot.`;
   if (next.length > 900) {
     next = `${next.slice(0, 897)}…`;
   }
@@ -826,20 +827,14 @@ export async function curateTourPhotos(tourId: string) {
       const uploadOrdered = [...included].sort(
         (a, b) => a.sort_order - b.sort_order,
       );
-      const sameRoomMulti =
-        uploadOrdered.length >= 3 &&
-        uploadOrdered.every(
-          (photo) => photo.room_type === uploadOrdered[0]!.room_type,
-        );
-      const initialPlan = await planWalkthroughSequence(uploadOrdered);
-      const sequenced = sameRoomMulti
-        ? orderSameRoomWalkPhotos(uploadOrdered)
-        : initialPlan.photo_sequence
-            .map((id) => uploadOrdered.find((photo) => photo.id === id))
-            .filter((photo): photo is Photo => Boolean(photo));
-      const plan = sameRoomMulti
-        ? await rebuildWalkthroughPlanForOrder(sequenced, initialPlan)
-        : initialPlan;
+      const plan = await planWalkthroughSequence(uploadOrdered);
+      const byId = new Map(uploadOrdered.map((photo) => [photo.id, photo]));
+      let sequenced = plan.photo_sequence
+        .map((id) => byId.get(id))
+        .filter((photo): photo is Photo => Boolean(photo));
+      if (sequenced.length !== uploadOrdered.length) {
+        sequenced = uploadOrdered;
+      }
       const rejected = record.photos.filter((photo) => photo.rejected);
       record.photos = [...sequenced, ...rejected];
       record.photos.forEach((photo, index) => {
