@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
+import { ffmpegBinary } from "./ffmpeg";
 import { readPhotoBytes, writeClipBytes } from "./store";
 import type { Photo } from "./types";
 
@@ -31,7 +32,7 @@ export async function generatePhotoHoldClip(
       ? `scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='min(1.0+0.0006*on,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=1920x1080:fps=${fps},setsar=1`
       : "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30";
 
-    await execFileAsync("ffmpeg", [
+    await execFileAsync(await ffmpegBinary(), [
       "-y",
       "-loop",
       "1",

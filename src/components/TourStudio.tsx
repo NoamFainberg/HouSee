@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import { ROOM_LABELS, WALKTHROUGH_ORDER } from "@/lib/rooms";
 import { isGenerationStale } from "@/lib/generation";
@@ -46,6 +46,35 @@ export function TourStudio({
   }, [tourId]);
 
   const tourStatus = detail?.tour.status;
+  const resumedStitch = useRef(false);
+  useEffect(() => {
+    if (resumedStitch.current || tourStatus !== "failed") return;
+    const message = detail?.tour.error ?? "";
+    const label = detail?.tour.progress_label ?? "";
+    const stitchFailed = label === "Stitch failed" || /ffmpeg|stitch/i.test(message);
+    const clips = detail?.clips ?? [];
+    const clipsReady =
+      clips.length > 0 &&
+      clips.every((clip) => clip.status === "completed" && clip.video_path);
+    if (!stitchFailed || !clipsReady) return;
+    const kick = setTimeout(() => {
+      resumedStitch.current = true;
+      setDetail((current) => {
+        if (!current || current.tour.status !== "failed") return current;
+        return {
+          ...current,
+          tour: {
+            ...current.tour,
+            status: "stitching",
+            progress_label: "Stitching master cut…",
+            error: null,
+          },
+        };
+      });
+    }, 0);
+    return () => clearTimeout(kick);
+  }, [tourStatus, detail]);
+
   useEffect(() => {
     if (!tourStatus || !ACTIVE.has(tourStatus)) return;
     const kick = setTimeout(() => {

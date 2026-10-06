@@ -375,6 +375,7 @@ async function finishTourIfReady(tourId: string) {
   await mutateTour(tourId, (current) => {
     current.tour.status = "stitching";
     current.tour.progress_label = "Stitching master cut…";
+    current.tour.error = null;
   });
   try {
     const masterPath = await stitchTour(tourId);
@@ -392,6 +393,40 @@ async function finishTourIfReady(tourId: string) {
       current.tour.progress_label = "Stitch failed";
     });
   }
+}
+
+function clipsReadyToStitch(record: Awaited<ReturnType<typeof readTourRecord>>) {
+  return (
+    record.clips.length > 0 &&
+    record.clips.every((clip) => clip.status === "completed" && clip.video_path)
+  );
+}
+
+/**
+ * Tours that already rendered every shot can still be stuck on "Stitch failed"
+ * from a host that had no ffmpeg. Reassemble those clips without new renders.
+ */
+export async function resumeFailedStitch(tourId: string) {
+  const existing = advanceLocks.get(tourId);
+  if (existing) {
+    await existing;
+    return;
+  }
+
+  const run = (async () => {
+    const record = await readTourRecord(tourId);
+    if (record.tour.status !== "failed" || !clipsReadyToStitch(record)) return;
+    const stitchFailure =
+      record.tour.progress_label === "Stitch failed" ||
+      /ffmpeg|stitch/i.test(record.tour.error ?? "");
+    if (!stitchFailure) return;
+    await finishTourIfReady(tourId);
+  })().finally(() => {
+    advanceLocks.delete(tourId);
+  });
+
+  advanceLocks.set(tourId, run);
+  await run;
 }
 
 /** One short pass: submit anything missing, pick up finished Higgsfield shots, stitch when all are in. */

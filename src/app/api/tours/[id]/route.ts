@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { advanceGeneratingTour } from "@/lib/pipeline";
+import { advanceGeneratingTour, resumeFailedStitch } from "@/lib/pipeline";
 import { getTourDetail, mutateTour } from "@/lib/store";
 import type { RoomType } from "@/lib/types";
 
@@ -15,6 +15,10 @@ export async function GET(_request: Request, context: RouteCtx) {
     const detail = await getTourDetail(id);
     if (detail.tour.status === "generating" || detail.tour.status === "stitching") {
       await advanceGeneratingTour(id);
+      return NextResponse.json(await getTourDetail(id));
+    }
+    if (detail.tour.status === "failed") {
+      await resumeFailedStitch(id);
       return NextResponse.json(await getTourDetail(id));
     }
     return NextResponse.json(detail);

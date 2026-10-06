@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
+import { ffmpegBinary } from "./ffmpeg";
 import { readMediaBytes, readTourRecord, writeMasterBytes } from "./store";
 import type { Clip } from "./types";
 
@@ -17,28 +18,23 @@ const END_HOLD_SEC = 0.45;
 const SCALE_FILTER =
   "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1";
 
-async function assertFfmpeg() {
-  try {
-    await execFileAsync("ffmpeg", ["-version"]);
-  } catch {
-    throw new Error(
-      "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg`) and retry.",
-    );
-  }
+async function runFfmpeg(args: string[]) {
+  return execFileAsync(await ffmpegBinary(), args, { maxBuffer: 8 * 1024 * 1024 });
 }
 
 async function probeDurationSeconds(file: string): Promise<number> {
-  const probe = await execFileAsync("ffprobe", [
-    "-v",
-    "error",
-    "-show_entries",
-    "format=duration",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
-    file,
-  ]);
-  const parsed = Number(probe.stdout.trim());
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 4;
+  let text = "";
+  try {
+    const probe = await runFfmpeg(["-hide_banner", "-i", file, "-f", "null", "-"]);
+    text = `${probe.stdout}\n${probe.stderr}`;
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string };
+    text = `${err.stdout ?? ""}\n${err.stderr ?? ""}`;
+  }
+  const match = text.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!match) return 4;
+  const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 4;
 }
 
 async function titlePng(title: string): Promise<Buffer> {
@@ -78,7 +74,7 @@ async function normalizeHoldClip(
   inputPath: string,
   outputPath: string,
 ): Promise<number> {
-  await execFileAsync("ffmpeg", [
+  await runFfmpeg([
     "-y",
     "-i",
     inputPath,
@@ -87,6 +83,8 @@ async function normalizeHoldClip(
     "-an",
     "-c:v",
     "libx264",
+    "-preset",
+    "veryfast",
     "-pix_fmt",
     "yuv420p",
     "-r",
@@ -121,7 +119,7 @@ async function normalizeMorphClip(
     ? `${SCALE_FILTER},tpad=stop_mode=clone:stop_duration=${holdTail}`
     : SCALE_FILTER;
 
-  await execFileAsync("ffmpeg", [
+  await runFfmpeg([
     "-y",
     "-ss",
     String(startSec),
@@ -134,6 +132,8 @@ async function normalizeMorphClip(
     "-an",
     "-c:v",
     "libx264",
+    "-preset",
+    "veryfast",
     "-pix_fmt",
     "yuv420p",
     "-r",
@@ -159,7 +159,7 @@ async function concatClips(clipPaths: string[], outputPath: string): Promise<voi
     clipPaths.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join("\n"),
   );
 
-  await execFileAsync("ffmpeg", [
+  await runFfmpeg([
     "-y",
     "-f",
     "concat",
@@ -169,6 +169,8 @@ async function concatClips(clipPaths: string[], outputPath: string): Promise<voi
     listPath,
     "-c:v",
     "libx264",
+    "-preset",
+    "veryfast",
     "-pix_fmt",
     "yuv420p",
     "-r",
@@ -179,7 +181,7 @@ async function concatClips(clipPaths: string[], outputPath: string): Promise<voi
 }
 
 export async function stitchTour(tourId: string): Promise<string> {
-  await assertFfmpeg();
+  await ffmpegBinary();
   const record = await readTourRecord(tourId);
   const clips = record.clips
     .filter((clip) => clip.status === "completed" && clip.video_path)
@@ -217,7 +219,7 @@ export async function stitchTour(tourId: string): Promise<string> {
     const titlePath = join(work, "title.png");
     const titleVideo = join(work, "title.mp4");
     await writeFile(titlePath, await titlePng(record.tour.title || "House tour"));
-    await execFileAsync("ffmpeg", [
+    await runFfmpeg([
       "-y",
       "-loop",
       "1",
@@ -227,6 +229,8 @@ export async function stitchTour(tourId: string): Promise<string> {
       titlePath,
       "-c:v",
       "libx264",
+      "-preset",
+      "veryfast",
       "-pix_fmt",
       "yuv420p",
       "-r",
@@ -243,7 +247,7 @@ export async function stitchTour(tourId: string): Promise<string> {
     );
 
     const body = join(work, "body.mp4");
-    await execFileAsync("ffmpeg", [
+    await runFfmpeg([
       "-y",
       "-f",
       "concat",
@@ -253,6 +257,8 @@ export async function stitchTour(tourId: string): Promise<string> {
       concatList,
       "-c:v",
       "libx264",
+      "-preset",
+      "veryfast",
       "-pix_fmt",
       "yuv420p",
       "-r",
@@ -261,18 +267,9 @@ export async function stitchTour(tourId: string): Promise<string> {
       body,
     ]);
 
-    const probe = await execFileAsync("ffprobe", [
-      "-v",
-      "error",
-      "-show_entries",
-      "format=duration",
-      "-of",
-      "default=noprint_wrappers=1:nokey=1",
-      body,
-    ]);
-    const duration = Math.max(4, Number(probe.stdout.trim()) || 40);
+    const duration = Math.max(4, await probeDurationSeconds(body));
     const ambient = join(work, "ambient.wav");
-    await execFileAsync("ffmpeg", [
+    await runFfmpeg([
       "-y",
       "-f",
       "lavfi",
@@ -288,7 +285,7 @@ export async function stitchTour(tourId: string): Promise<string> {
     ]);
 
     const master = join(work, "master.mp4");
-    await execFileAsync("ffmpeg", [
+    await runFfmpeg([
       "-y",
       "-i",
       body,
