@@ -82,8 +82,9 @@ export function HomeClient({
             A house that moves.
           </h1>
           <p className="mt-5 max-w-lg text-base leading-7 text-[var(--muted)]">
-            Upload Airbnb-style apartment photos. HouSee tags rooms, asks
-            Higgsfield for cinematic camera moves, and stitches a 16:9 walkthrough.
+            Upload the photos, set the sequence, and build a drone reel.
+            If a shot jumps or cuts through a wall, describe what is wrong and
+            replace that reel. The rest of the tour stays in place.
           </p>
         </div>
         <div className="rounded-3xl border border-[var(--line)] bg-white/55 p-5 shadow-[0_20px_80px_rgba(22,17,12,0.06)] backdrop-blur">
@@ -136,7 +137,7 @@ export function HomeClient({
             disabled={Boolean(busy)}
             className="mt-5 w-full rounded-full bg-ink px-5 py-3 text-sm font-medium text-[var(--paper)] disabled:opacity-60"
           >
-            {busy ?? "Create walkthrough"}
+            {busy ?? "Upload and sequence"}
           </button>
         </div>
       </section>

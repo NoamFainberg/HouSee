@@ -1,12 +1,25 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { ChevronDown, ChevronUp, Download, RefreshCw } from "lucide-react";
-import { clipLabel, ROOM_LABELS, WALKTHROUGH_ORDER } from "@/lib/rooms";
+import { ChevronLeft, ChevronRight, Download } from "lucide-react";
+import { ROOM_LABELS, WALKTHROUGH_ORDER } from "@/lib/rooms";
 import { isGenerationStale } from "@/lib/generation";
-import type { RoomType, TourDetail } from "@/lib/types";
+import type { ClipWithUrl, PhotoWithUrl, RoomType, TourDetail } from "@/lib/types";
 
 const ACTIVE = new Set(["generating", "stitching", "curating"]);
+
+function shotEnds(clip: ClipWithUrl, photos: PhotoWithUrl[]) {
+  const included = photos.filter((photo) => !photo.rejected);
+  const start = photos.find((photo) => photo.id === clip.photo_id);
+  const end = clip.end_photo_id
+    ? photos.find((photo) => photo.id === clip.end_photo_id)
+    : undefined;
+  const startIndex = start
+    ? included.findIndex((photo) => photo.id === start.id)
+    : -1;
+  const endIndex = end ? included.findIndex((photo) => photo.id === end.id) : -1;
+  return { start, end, startIndex, endIndex };
+}
 
 export function TourStudio({
   tourId,
@@ -20,6 +33,10 @@ export function TourStudio({
     initial ? null : "Tour not found",
   );
   const [busy, setBusy] = useState<string | null>(null);
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(
+    initial?.clips[0]?.id ?? null,
+  );
+  const [note, setNote] = useState(initial?.clips[0]?.revision_note ?? "");
 
   const refresh = useCallback(async () => {
     const response = await fetch(`/api/tours/${tourId}`, { cache: "no-store" });
@@ -35,6 +52,11 @@ export function TourStudio({
     }, 2500);
     return () => clearInterval(timer);
   }, [detail, refresh]);
+
+  function selectClip(clip: ClipWithUrl) {
+    setSelectedClipId(clip.id);
+    setNote(clip.revision_note ?? "");
+  }
 
   async function savePhotos() {
     if (!detail) return;
@@ -55,26 +77,8 @@ export function TourStudio({
     setDetail(json);
   }
 
-  async function recurate() {
-    setBusy("Retagging rooms…");
-    setError(null);
-    try {
-      await savePhotos();
-      const response = await fetch(`/api/tours/${tourId}/curate`, {
-        method: "POST",
-      });
-      const json = await response.json();
-      if (!response.ok) throw new Error(json.error || "Curation failed");
-      setDetail(json);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Curation failed");
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function generate() {
-    setBusy("Starting generation…");
+    setBusy("Building reel…");
     setError(null);
     try {
       await savePhotos();
@@ -91,19 +95,25 @@ export function TourStudio({
     }
   }
 
-  async function retryClip(clipId: string) {
-    setBusy("Retrying clip…");
+  async function replaceReel(clipId: string) {
+    const text = note.trim();
+    if (text.length < 8) {
+      setError("Describe what is wrong with this reel.");
+      return;
+    }
+    setBusy("Replacing reel…");
     setError(null);
     try {
-      const response = await fetch(
-        `/api/tours/${tourId}/clips/${clipId}/retry`,
-        { method: "POST" },
-      );
+      const response = await fetch(`/api/tours/${tourId}/clips/${clipId}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: text }),
+      });
       const json = await response.json();
-      if (!response.ok) throw new Error(json.error || "Retry failed");
+      if (!response.ok) throw new Error(json.error || "Replace failed");
       setDetail(json);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Retry failed");
+      setError(err instanceof Error ? err.message : "Replace failed");
     } finally {
       setBusy(null);
     }
@@ -140,7 +150,11 @@ export function TourStudio({
   const generating = ACTIVE.has(tour.status);
   const staleGeneration = generating && isGenerationStale(tour.updated_at);
   const blockingGeneration = generating && !staleGeneration;
-  const includedCount = photos.filter((photo) => !photo.rejected).length;
+  const included = photos.filter((photo) => !photo.rejected);
+  const selected =
+    clips.find((clip) => clip.id === selectedClipId) ?? clips[0] ?? null;
+  const selectedEnds = selected ? shotEnds(selected, photos) : null;
+  const canReplace = Boolean(selected?.end_photo_id);
 
   return (
     <main className="mx-auto w-full max-w-6xl px-6 pb-24">
@@ -152,42 +166,37 @@ export function TourStudio({
           <h1 className="serif mt-2 text-4xl tracking-tight md:text-5xl">
             {tour.title}
           </h1>
-          <p className="mt-2 text-[var(--muted)]">
-            {tour.progress_label || "Review the walkthrough order, then generate."}
+          <p className="mt-2 max-w-xl text-[var(--muted)]">
+            {tour.progress_label ||
+              "Set the photo sequence, build the reel, then replace any shot that breaks the walk."}
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={() => void recurate()}
-            disabled={Boolean(busy) || blockingGeneration}
-            className="rounded-full border border-[var(--line)] bg-white/60 px-4 py-2 text-sm disabled:opacity-50"
-          >
-            Re-tag rooms
-          </button>
-          <button
-            type="button"
-            onClick={() => void generate()}
-            disabled={Boolean(busy) || blockingGeneration || includedCount === 0}
-            className="rounded-full bg-ink px-5 py-2 text-sm text-[var(--paper)] disabled:opacity-50"
-          >
-            {blockingGeneration
-              ? "Generating…"
-              : staleGeneration
-                ? "Resume generation"
-                : busy ?? "Generate tour"}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => void generate()}
+          disabled={Boolean(busy) || blockingGeneration || included.length === 0}
+          className="rounded-full bg-ink px-5 py-2.5 text-sm text-[var(--paper)] disabled:opacity-50"
+        >
+          {blockingGeneration
+            ? "Building reel…"
+            : staleGeneration
+              ? "Resume reel"
+              : busy ?? (clips.length ? "Rebuild reel" : "Build reel")}
+        </button>
       </div>
+
+      <ol className="mt-6 flex flex-wrap gap-3 text-xs uppercase tracking-[0.16em] text-[var(--muted)]">
+        <li className="text-ink">1 · Upload</li>
+        <li className="text-ink">2 · Sequence</li>
+        <li className={clips.length ? "text-ink" : ""}>3 · Reel</li>
+      </ol>
 
       {tour.error && (
         <p className="mt-4 rounded-2xl border border-[var(--danger)]/30 bg-white/70 px-4 py-3 text-sm text-[var(--danger)]">
           {tour.error}
         </p>
       )}
-      {error && (
-        <p className="mt-4 text-sm text-[var(--danger)]">{error}</p>
-      )}
+      {error && <p className="mt-4 text-sm text-[var(--danger)]">{error}</p>}
 
       {generating && (
         <div className="mt-6 h-1 overflow-hidden rounded-full bg-[var(--paper-2)]">
@@ -205,16 +214,108 @@ export function TourStudio({
         </div>
       )}
 
+      <section className="mt-8">
+        <div className="flex items-end justify-between gap-3">
+          <div>
+            <h2 className="serif text-2xl">Sequence</h2>
+            <p className="mt-1 text-sm text-[var(--muted)]">
+              This order is the walk. Each photo blends into the next as a drone move inside the room.
+            </p>
+          </div>
+          <p className="text-sm text-[var(--muted)]">{included.length} in the tour</p>
+        </div>
+        <ul className="mt-4 flex gap-3 overflow-x-auto pb-2">
+          {photos.map((photo, index) => (
+            <li
+              key={photo.id}
+              className={`w-52 shrink-0 overflow-hidden rounded-2xl border bg-white/70 ${
+                photo.rejected ? "border-[var(--line)] opacity-50" : "border-[var(--brass)]/40"
+              }`}
+            >
+              <div className="relative">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={photo.url}
+                  alt={photo.original_filename ?? "Listing photo"}
+                  className="aspect-[4/3] w-full object-cover"
+                />
+                <span className="absolute left-2 top-2 rounded-full bg-ink/80 px-2 py-1 text-[10px] uppercase tracking-wider text-[var(--paper)]">
+                  {photo.rejected ? "Out" : String(included.findIndex((item) => item.id === photo.id) + 1)}
+                </span>
+              </div>
+              <div className="space-y-2 p-2">
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => movePhoto(index, -1)}
+                    className="rounded-lg border border-[var(--line)] p-1"
+                    aria-label="Move earlier"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => movePhoto(index, 1)}
+                    className="rounded-lg border border-[var(--line)] p-1"
+                    aria-label="Move later"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                  <select
+                    value={photo.room_type}
+                    onChange={(event) => {
+                      const room_type = event.target.value as RoomType;
+                      setDetail((current) =>
+                        current
+                          ? {
+                              ...current,
+                              photos: current.photos.map((item) =>
+                                item.id === photo.id ? { ...item, room_type } : item,
+                              ),
+                            }
+                          : current,
+                      );
+                    }}
+                    className="min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-transparent px-1 py-1 text-xs"
+                  >
+                    {WALKTHROUGH_ORDER.map((room) => (
+                      <option key={room} value={room}>
+                        {ROOM_LABELS[room]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <label className="flex items-center gap-2 text-xs text-[var(--muted)]">
+                  <input
+                    type="checkbox"
+                    checked={!photo.rejected}
+                    onChange={(event) => {
+                      const rejected = !event.target.checked;
+                      setDetail((current) =>
+                        current
+                          ? {
+                              ...current,
+                              photos: current.photos.map((item) =>
+                                item.id === photo.id ? { ...item, rejected } : item,
+                              ),
+                            }
+                          : current,
+                      );
+                    }}
+                  />
+                  Include
+                </label>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+
       {masterUrl && (
         <section className="mt-8 overflow-hidden rounded-3xl border border-[var(--line)] bg-black">
-          <video
-            className="aspect-video w-full"
-            src={masterUrl}
-            controls
-            playsInline
-          />
+          <video className="aspect-video w-full" src={masterUrl} controls playsInline />
           <div className="flex items-center justify-between px-5 py-3 text-sm text-[var(--paper)]">
-            <span>Master walkthrough</span>
+            <span>Full tour</span>
             <a
               href={masterUrl}
               download
@@ -227,177 +328,122 @@ export function TourStudio({
         </section>
       )}
 
-      {clips.length > 0 && (
-        <section className="mt-10">
-          <h2 className="serif text-2xl">Clips</h2>
-          <ul className="mt-4 grid gap-3 md:grid-cols-2">
-            {clips.map((clip) => {
-              const endPhoto = clip.end_photo_id
-                ? photos.find((photo) => photo.id === clip.end_photo_id)
-                : undefined;
-              const title = endPhoto
-                ? clipLabel(
-                    (clip.room_type as RoomType) ?? "other",
-                    endPhoto.room_type,
-                  )
-                : ROOM_LABELS[(clip.room_type as RoomType) ?? "other"];
+      <section className="mt-8 rounded-3xl bg-ink px-4 py-4 text-[var(--paper)] md:px-5">
+        <div className="flex items-end justify-between gap-3">
+          <div>
+            <h2 className="serif text-2xl">Reel</h2>
+            <p className="mt-1 text-sm text-white/60">
+              Each card is one blend. Pick a shot, say what is wrong, and that reel is replaced in the tour.
+            </p>
+          </div>
+        </div>
+
+        {clips.length === 0 ? (
+          <p className="mt-6 rounded-2xl border border-white/10 px-4 py-8 text-center text-sm text-white/60">
+            Build the reel to see the walk as separate shots.
+          </p>
+        ) : (
+          <ul className="mt-4 flex gap-3 overflow-x-auto pb-2">
+            {clips.map((clip, index) => {
+              const ends = shotEnds(clip, photos);
+              const active = clip.id === selected?.id;
+              const poster = ends.start?.url;
               return (
-              <li
-                key={clip.id}
-                className="rounded-2xl border border-[var(--line)] bg-white/55 p-4"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="font-medium">{title}</p>
-                    <p className="text-sm capitalize text-[var(--muted)]">
-                      {clip.status}
-                      {clip.camera_move ? ` · ${clip.camera_move}` : ""}
-                    </p>
-                    {clip.error && (
-                      <p className="mt-2 text-sm text-[var(--danger)]">
-                        {clip.error}
-                      </p>
-                    )}
-                    {clip.prompt && clip.end_photo_id && (
-                      <p className="mt-2 line-clamp-3 text-xs leading-relaxed text-[var(--muted)]">
-                        {clip.prompt}
-                      </p>
-                    )}
-                  </div>
-                  {(clip.status === "failed" ||
-                    clip.status === "completed" ||
-                    clip.status === "submitted") && (
-                    <button
-                      type="button"
-                      onClick={() => void retryClip(clip.id)}
-                      disabled={Boolean(busy) || blockingGeneration}
-                      className="inline-flex items-center gap-1 rounded-full border border-[var(--line)] px-3 py-1 text-xs disabled:opacity-50"
-                    >
-                      <RefreshCw size={12} />
-                      Retry
-                    </button>
-                  )}
-                </div>
-                {clip.playbackUrl && (
-                  <video
-                    className="mt-3 aspect-video w-full rounded-xl bg-ink"
-                    src={clip.playbackUrl}
-                    controls
-                    playsInline
-                  />
-                )}
-              </li>
-            );
+                <li key={clip.id} className="w-44 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => selectClip(clip)}
+                    className={`w-full overflow-hidden rounded-2xl border text-left ${
+                      active ? "border-[var(--brass-2)]" : "border-white/10"
+                    }`}
+                  >
+                    <div className="relative aspect-video bg-black">
+                      {clip.playbackUrl ? (
+                        <video
+                          className="h-full w-full object-cover"
+                          src={clip.playbackUrl}
+                          muted
+                          playsInline
+                        />
+                      ) : poster ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={poster} alt="" className="h-full w-full object-cover opacity-80" />
+                      ) : null}
+                      <span className="absolute left-2 top-2 rounded-full bg-black/70 px-2 py-0.5 text-[10px] uppercase tracking-wider">
+                        Shot {index + 1}
+                      </span>
+                    </div>
+                    <div className="px-2 py-2 text-xs text-white/70">
+                      {ends.end
+                        ? `${ends.startIndex + 1} → ${ends.endIndex + 1}`
+                        : "Still"}
+                      <span className="mt-0.5 block capitalize text-white/45">
+                        {clip.status === "submitted" ? "Replacing…" : clip.status}
+                      </span>
+                    </div>
+                  </button>
+                </li>
+              );
             })}
           </ul>
-        </section>
-      )}
+        )}
 
-      <section className="mt-10">
-        <div className="flex items-end justify-between">
-          <h2 className="serif text-2xl">Walkthrough order</h2>
-          <p className="text-sm text-[var(--muted)]">
-            {includedCount} included · floorplans and dupes stay excluded
-          </p>
-        </div>
-        <ul className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {photos.map((photo, index) => (
-            <li
-              key={photo.id}
-              className={`overflow-hidden rounded-2xl border bg-white/60 ${
-                photo.rejected
-                  ? "border-[var(--line)] opacity-60"
-                  : "border-[var(--brass)]/35"
-              }`}
-            >
-              <div className="relative">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={photo.url}
-                  alt={photo.original_filename ?? "Listing photo"}
-                  className="aspect-[4/3] w-full object-cover"
+        {selected && selectedEnds && (
+          <div className="mt-4 grid gap-4 rounded-2xl border border-white/10 p-4 md:grid-cols-[1.2fr_0.8fr]">
+            <div>
+              {selected.playbackUrl ? (
+                <video
+                  key={selected.playbackUrl}
+                  className="aspect-video w-full rounded-xl bg-black"
+                  src={selected.playbackUrl}
+                  controls
+                  playsInline
                 />
-                {photo.is_hero && !photo.rejected && (
-                  <span className="absolute left-3 top-3 rounded-full bg-ink/80 px-2 py-1 text-[10px] uppercase tracking-wider text-[var(--paper)]">
-                    Hero
-                  </span>
-                )}
-              </div>
-              <div className="space-y-3 p-3">
-                <div className="flex items-center gap-2">
-                  <select
-                    value={photo.room_type}
-                    onChange={(event) => {
-                      const room_type = event.target.value as RoomType;
-                      setDetail((current) =>
-                        current
-                          ? {
-                              ...current,
-                              photos: current.photos.map((item) =>
-                                item.id === photo.id
-                                  ? { ...item, room_type }
-                                  : item,
-                              ),
-                            }
-                          : current,
-                      );
-                    }}
-                    className="w-full rounded-lg border border-[var(--line)] bg-transparent px-2 py-1 text-sm"
-                  >
-                    {WALKTHROUGH_ORDER.map((room) => (
-                      <option key={room} value={room}>
-                        {ROOM_LABELS[room]}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => movePhoto(index, -1)}
-                    className="rounded-lg border border-[var(--line)] p-1"
-                    aria-label="Move up"
-                  >
-                    <ChevronUp size={16} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => movePhoto(index, 1)}
-                    className="rounded-lg border border-[var(--line)] p-1"
-                    aria-label="Move down"
-                  >
-                    <ChevronDown size={16} />
-                  </button>
+              ) : (
+                <div className="flex aspect-video items-center justify-center rounded-xl bg-black/40 text-sm text-white/60">
+                  {selected.status === "submitted" || selected.status === "pending"
+                    ? "Replacing this reel…"
+                    : "This shot has no video yet."}
                 </div>
-                <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
-                  <input
-                    type="checkbox"
-                    checked={!photo.rejected}
-                    onChange={(event) => {
-                      const rejected = !event.target.checked;
-                      setDetail((current) =>
-                        current
-                          ? {
-                              ...current,
-                              photos: current.photos.map((item) =>
-                                item.id === photo.id
-                                  ? { ...item, rejected }
-                                  : item,
-                              ),
-                            }
-                          : current,
-                      );
-                    }}
-                  />
-                  Include in tour
-                </label>
-                {photo.reject_reason && (
-                  <p className="text-xs text-[var(--muted)]">
-                    Flagged: {photo.reject_reason}
-                  </p>
-                )}
-              </div>
-            </li>
-          ))}
-        </ul>
+              )}
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.18em] text-[var(--brass-2)]">
+                {selectedEnds.end
+                  ? `Shot ${clips.findIndex((clip) => clip.id === selected.id) + 1} · photo ${selectedEnds.startIndex + 1} → ${selectedEnds.endIndex + 1}`
+                  : "Still frame"}
+              </p>
+              <h3 className="serif mt-2 text-2xl">What is wrong with this shot?</h3>
+              <p className="mt-2 text-sm leading-6 text-white/60">
+                The replacement keeps the same opening and closing photos. It still has to stay inside the room: no walls, no invented spaces, no jump to a different picture.
+              </p>
+              <textarea
+                value={note}
+                onChange={(event) => setNote(event.target.value)}
+                maxLength={400}
+                rows={4}
+                placeholder="It passes through the wall between the TV and the window. Glide along the open floor instead."
+                className="mt-3 w-full resize-none rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-[var(--paper)] outline-none placeholder:text-white/35"
+              />
+              {selected.error && (
+                <p className="mt-2 text-sm text-red-300">{selected.error}</p>
+              )}
+              <button
+                type="button"
+                onClick={() => void replaceReel(selected.id)}
+                disabled={Boolean(busy) || blockingGeneration || !canReplace}
+                className="mt-3 rounded-full bg-[var(--paper)] px-4 py-2 text-sm text-ink disabled:opacity-40"
+              >
+                Replace this reel
+              </button>
+              {!canReplace && (
+                <p className="mt-2 text-xs text-white/50">
+                  This card is a still. Rebuild the reel so each step is a blend into the next photo.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
       </section>
     </main>
   );
