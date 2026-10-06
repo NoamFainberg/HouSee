@@ -16,9 +16,7 @@ export async function startTourGeneration(
     });
     return;
   }
-  void runTourPipeline(tourId, options).catch((error) => {
-    console.error("Inline tour pipeline failed", error);
-  });
+  await runTourPipeline(tourId, options);
 }
 
 export async function startClipRetry(
@@ -33,7 +31,5 @@ export async function startClipRetry(
     });
     return;
   }
-  void retryClipAndMaybeStitch(tourId, clipId, note).catch((error) => {
-    console.error("Inline clip retry failed", error);
-  });
+  await retryClipAndMaybeStitch(tourId, clipId, note);
 }

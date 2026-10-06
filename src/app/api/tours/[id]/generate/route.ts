@@ -5,6 +5,7 @@ import { isGenerationStale } from "@/lib/generation";
 import { getTourDetail, mutateTour } from "@/lib/store";
 
 export const runtime = "nodejs";
+export const maxDuration = 300;
 
 type RouteCtx = { params: Promise<{ id: string }> };
 

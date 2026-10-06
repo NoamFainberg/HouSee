@@ -1,14 +1,23 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { advanceGeneratingTour } from "@/lib/pipeline";
 import { getTourDetail, mutateTour } from "@/lib/store";
 import type { RoomType } from "@/lib/types";
 
 type RouteCtx = { params: Promise<{ id: string }> };
 
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
 export async function GET(_request: Request, context: RouteCtx) {
   try {
     const { id } = await context.params;
-    return NextResponse.json(await getTourDetail(id));
+    const detail = await getTourDetail(id);
+    if (detail.tour.status === "generating" || detail.tour.status === "stitching") {
+      await advanceGeneratingTour(id);
+      return NextResponse.json(await getTourDetail(id));
+    }
+    return NextResponse.json(detail);
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Tour not found" },

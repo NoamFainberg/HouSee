@@ -45,13 +45,20 @@ export function TourStudio({
     setDetail(json);
   }, [tourId]);
 
+  const tourStatus = detail?.tour.status;
   useEffect(() => {
-    if (!detail || !ACTIVE.has(detail.tour.status)) return;
+    if (!tourStatus || !ACTIVE.has(tourStatus)) return;
+    const kick = setTimeout(() => {
+      void refresh().catch(() => undefined);
+    }, 0);
     const timer = setInterval(() => {
       void refresh().catch(() => undefined);
-    }, 2500);
-    return () => clearInterval(timer);
-  }, [detail, refresh]);
+    }, 8000);
+    return () => {
+      clearTimeout(kick);
+      clearInterval(timer);
+    };
+  }, [tourStatus, refresh]);
 
   function selectClip(clip: ClipWithUrl) {
     setSelectedClipId(clip.id);
@@ -170,6 +177,11 @@ export function TourStudio({
             {tour.progress_label ||
               "Set the photo sequence, build the reel, then replace any shot that breaks the walk."}
           </p>
+          {generating && (
+            <p className="mt-2 max-w-xl text-sm text-[var(--muted)]">
+              You can leave this page. The shots keep rendering, and the tour finishes when you open it again.
+            </p>
+          )}
         </div>
         <button
           type="button"

@@ -6,6 +6,7 @@ import {
 } from "./rooms";
 import { hasHiggsfieldEnv, generationConcurrency } from "./env";
 import {
+  checkGeneration,
   downloadBinary,
   pollGeneration,
   submitWalkthroughGeneration,
@@ -192,6 +193,7 @@ export async function generateOneClip(
   tourId: string,
   clipId: string,
   uploadCache: Map<string, Promise<string>> = photoUploadCache(),
+  options?: { wait?: boolean },
 ) {
   if (!hasHiggsfieldEnv()) {
     throw new Error(
@@ -282,16 +284,46 @@ export async function generateOneClip(
     );
   }
 
-  const videoUrl = await pollGeneration(requestId, {
-    onStatus: async (status, elapsedMs) => {
-      await touchTourProgress(
-        tourId,
-        clipId,
-        label,
-        clipProgressLabel(label, status, elapsedMs),
-      );
-    },
-  });
+  const wait = options?.wait !== false;
+  let videoUrl: string;
+  if (!wait) {
+    try {
+      const checked = await checkGeneration(requestId);
+      if (!checked.videoUrl) {
+        await touchTourProgress(
+          tourId,
+          clipId,
+          label,
+          `Rendering in the background (${checked.status}). You can leave this page.`,
+        );
+        return;
+      }
+      videoUrl = checked.videoUrl;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (!/Higgsfield generation (failed|nsfw|canceled)/.test(message)) {
+        await touchTourProgress(
+          tourId,
+          clipId,
+          label,
+          "Rendering in the background. You can leave this page.",
+        );
+        return;
+      }
+      throw error;
+    }
+  } else {
+    videoUrl = await pollGeneration(requestId, {
+      onStatus: async (status, elapsedMs) => {
+        await touchTourProgress(
+          tourId,
+          clipId,
+          label,
+          clipProgressLabel(label, status, elapsedMs),
+        );
+      },
+    });
+  }
 
   const storagePath = await writeClipBytes(
     tourId,
@@ -310,6 +342,94 @@ export async function generateOneClip(
     target.updated_at = new Date().toISOString();
     current.tour.updated_at = new Date().toISOString();
   });
+}
+
+const advanceLocks = new Map<string, Promise<void>>();
+
+async function finishTourIfReady(tourId: string) {
+  const record = await readTourRecord(tourId);
+  const clips = [...record.clips].sort((a, b) => a.sort_order - b.sort_order);
+  if (clips.length === 0) return;
+
+  const failed = clips.find((clip) => clip.status === "failed");
+  if (failed) {
+    await mutateTour(tourId, (current) => {
+      current.tour.status = "failed";
+      current.tour.error = failed.error ?? "A shot failed";
+      current.tour.progress_label = "Generation failed";
+    });
+    return;
+  }
+
+  const ready = clips.every((clip) => clip.status === "completed" && clip.video_path);
+  if (!ready) {
+    await mutateTour(tourId, (current) => {
+      if (current.tour.status === "failed") return;
+      current.tour.status = "generating";
+      current.tour.progress_label =
+        "Rendering in the background. You can leave this page.";
+    });
+    return;
+  }
+
+  await mutateTour(tourId, (current) => {
+    current.tour.status = "stitching";
+    current.tour.progress_label = "Stitching master cut…";
+  });
+  try {
+    const masterPath = await stitchTour(tourId);
+    await mutateTour(tourId, (current) => {
+      current.tour.status = "complete";
+      current.tour.master_path = masterPath;
+      current.tour.progress_label = "Tour ready";
+      current.tour.error = null;
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Stitch failed";
+    await mutateTour(tourId, (current) => {
+      current.tour.status = "failed";
+      current.tour.error = message;
+      current.tour.progress_label = "Stitch failed";
+    });
+  }
+}
+
+/** One short pass: submit anything missing, pick up finished Higgsfield shots, stitch when all are in. */
+export async function advanceGeneratingTour(tourId: string) {
+  const existing = advanceLocks.get(tourId);
+  if (existing) {
+    await existing;
+    return;
+  }
+
+  const run = (async () => {
+    const record = await readTourRecord(tourId);
+    if (record.tour.status !== "generating" && record.tour.status !== "stitching") {
+      return;
+    }
+    const cache = photoUploadCache();
+    for (const clip of [...record.clips].sort((a, b) => a.sort_order - b.sort_order)) {
+      if (clip.status === "completed" && clip.video_path) continue;
+      try {
+        await generateOneClip(tourId, clip.id, cache, { wait: false });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Clip generation failed";
+        await mutateTour(tourId, (current) => {
+          const target = current.clips.find((item) => item.id === clip.id);
+          if (target && target.status !== "completed") {
+            target.status = "failed";
+            target.error = message;
+          }
+        });
+      }
+    }
+    await finishTourIfReady(tourId);
+  })().finally(() => {
+    advanceLocks.delete(tourId);
+  });
+
+  advanceLocks.set(tourId, run);
+  await run;
 }
 
 async function sortedClips(tourId: string): Promise<Clip[]> {
@@ -407,7 +527,7 @@ export async function runTourPipeline(
           });
 
           try {
-            await generateOneClip(tourId, clip.id, uploadCache);
+            await generateOneClip(tourId, clip.id, uploadCache, { wait: false });
           } catch (error) {
             const message =
               error instanceof Error ? error.message : "Clip generation failed";
@@ -430,19 +550,7 @@ export async function runTourPipeline(
       }
     }
 
-    await mutateTour(tourId, (record) => {
-      record.tour.status = "stitching";
-      record.tour.progress_label = "Stitching master cut…";
-      record.tour.updated_at = new Date().toISOString();
-    });
-    const masterPath = await stitchTour(tourId);
-    await mutateTour(tourId, (record) => {
-      record.tour.status = "complete";
-      record.tour.master_path = masterPath;
-      record.tour.progress_label = "Tour ready";
-      record.tour.error = null;
-      record.tour.updated_at = new Date().toISOString();
-    });
+    await finishTourIfReady(tourId);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Pipeline failed";
     await mutateTour(tourId, (record) => {
@@ -495,7 +603,14 @@ export async function retryClipAndMaybeStitch(
     } else if (clip.end_photo_id) {
       await enrichClipPrompt(tourId, clipId);
     }
-    await generateOneClip(tourId, clipId);
+    await generateOneClip(tourId, clipId, photoUploadCache(), { wait: false });
+    await mutateTour(tourId, (current) => {
+      current.tour.status = "generating";
+      current.tour.progress_label =
+        "Replacing this reel in the background. You can leave this page.";
+      current.tour.updated_at = new Date().toISOString();
+    });
+    return;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Retry failed";
     await mutateTour(tourId, (current) => {
@@ -512,25 +627,4 @@ export async function retryClipAndMaybeStitch(
     });
     throw error;
   }
-
-  const refreshed = await readTourRecord(tourId);
-  const pending = refreshed.clips.filter((item) => item.status !== "completed");
-  if (pending.length > 0) {
-    await runTourPipeline(tourId, { resume: true });
-    return;
-  }
-
-  await mutateTour(tourId, (current) => {
-    current.tour.status = "stitching";
-    current.tour.progress_label = "Stitching master cut…";
-    current.tour.updated_at = new Date().toISOString();
-  });
-  const masterPath = await stitchTour(tourId);
-  await mutateTour(tourId, (current) => {
-    current.tour.status = "complete";
-    current.tour.master_path = masterPath;
-    current.tour.progress_label = "Tour ready";
-    current.tour.error = null;
-    current.tour.updated_at = new Date().toISOString();
-  });
 }

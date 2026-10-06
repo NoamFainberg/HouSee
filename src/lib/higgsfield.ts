@@ -173,31 +173,40 @@ export async function submitGeneration(
   return { requestId: json.request_id, model };
 }
 
+export async function checkGeneration(requestId: string): Promise<{
+  status: string;
+  videoUrl: string | null;
+}> {
+  const statusRes = await fetch(`${PLATFORM}/requests/${requestId}/status`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!statusRes.ok) {
+    throw new Error(
+      `Higgsfield status failed (${statusRes.status}): ${await statusRes.text()}`,
+    );
+  }
+  const json = await statusRes.json();
+  const status = (json.status as string | undefined) ?? "unknown";
+  if (status === "failed" || status === "nsfw" || status === "canceled") {
+    throw new Error(`Higgsfield generation ${status}`);
+  }
+  if (status === "completed") {
+    const videoUrl = extractVideoUrl(json);
+    if (!videoUrl) throw new Error("Higgsfield completed without a video URL");
+    return { status, videoUrl };
+  }
+  return { status, videoUrl: null };
+}
+
 export async function pollGeneration(
   requestId: string,
   options: PollOptions = {},
 ): Promise<string> {
   const started = Date.now();
   while (Date.now() - started < MAX_POLL_MS) {
-    const statusRes = await fetch(`${PLATFORM}/requests/${requestId}/status`, {
-      headers: { Authorization: authHeader() },
-    });
-    if (!statusRes.ok) {
-      throw new Error(
-        `Higgsfield status failed (${statusRes.status}): ${await statusRes.text()}`,
-      );
-    }
-    const json = await statusRes.json();
-    const status = (json.status as string | undefined) ?? "unknown";
-    await options.onStatus?.(status, Date.now() - started);
-    if (status === "completed") {
-      const url = extractVideoUrl(json);
-      if (!url) throw new Error("Higgsfield completed without a video URL");
-      return url;
-    }
-    if (status === "failed" || status === "nsfw" || status === "canceled") {
-      throw new Error(`Higgsfield generation ${status}`);
-    }
+    const checked = await checkGeneration(requestId);
+    await options.onStatus?.(checked.status, Date.now() - started);
+    if (checked.videoUrl) return checked.videoUrl;
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
   throw new Error("Higgsfield generation timed out after 12 minutes");
