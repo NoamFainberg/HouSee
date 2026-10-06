@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import { ROOM_LABELS, WALKTHROUGH_ORDER } from "@/lib/rooms";
-import { isGenerationStale } from "@/lib/generation";
 import type { ClipWithUrl, PhotoWithUrl, RoomType, TourDetail } from "@/lib/types";
 
 const ACTIVE = new Set(["generating", "stitching", "curating"]);
@@ -82,7 +81,7 @@ export function TourStudio({
     }, 0);
     const timer = setInterval(() => {
       void refresh().catch(() => undefined);
-    }, 8000);
+    }, 3000);
     return () => {
       clearTimeout(kick);
       clearInterval(timer);
@@ -184,8 +183,6 @@ export function TourStudio({
 
   const { tour, photos, clips, masterUrl } = detail;
   const generating = ACTIVE.has(tour.status);
-  const staleGeneration = generating && isGenerationStale(tour.updated_at);
-  const blockingGeneration = generating && !staleGeneration;
   const included = photos.filter((photo) => !photo.rejected);
   const selected =
     clips.find((clip) => clip.id === selectedClipId) ?? clips[0] ?? null;
@@ -206,22 +203,22 @@ export function TourStudio({
             {tour.progress_label ||
               "Set the photo sequence, build the reel, then replace any shot that breaks the walk."}
           </p>
-          {generating && (
+          {(generating || tour.status === "stitching") && (
             <p className="mt-2 max-w-xl text-sm text-[var(--muted)]">
-              You can leave this page. The shots keep rendering, and the tour finishes when you open it again.
+              Finished shots are kept. Opening this page saves them and builds the full tour. You can leave and come back.
             </p>
           )}
         </div>
         <button
           type="button"
           onClick={() => void generate()}
-          disabled={Boolean(busy) || blockingGeneration || included.length === 0}
+          disabled={Boolean(busy) || generating || included.length === 0}
           className="rounded-full bg-ink px-5 py-2.5 text-sm text-[var(--paper)] disabled:opacity-50"
         >
-          {blockingGeneration
-            ? "Building reel…"
-            : staleGeneration
-              ? "Resume reel"
+          {tour.status === "stitching"
+            ? "Assembling tour…"
+            : generating
+              ? "Saving shots…"
               : busy ?? (clips.length ? "Rebuild reel" : "Build reel")}
         </button>
       </div>
@@ -419,7 +416,13 @@ export function TourStudio({
                         ? `${ends.startIndex + 1} → ${ends.endIndex + 1}`
                         : "Still"}
                       <span className="mt-0.5 block capitalize text-white/45">
-                        {clip.status === "submitted" ? "Replacing…" : clip.status}
+                        {clip.status === "completed"
+                          ? "Ready"
+                          : clip.status === "failed"
+                            ? "Failed"
+                            : clip.revision_note
+                              ? "Replacing…"
+                              : "Rendering…"}
                       </span>
                     </div>
                   </button>
@@ -442,9 +445,9 @@ export function TourStudio({
                 />
               ) : (
                 <div className="flex aspect-video items-center justify-center rounded-xl bg-black/40 text-sm text-white/60">
-                  {selected.status === "submitted" || selected.status === "pending"
+                  {selected.revision_note
                     ? "Replacing this reel…"
-                    : "This shot has no video yet."}
+                    : "Rendering this shot…"}
                 </div>
               )}
             </div>
@@ -472,7 +475,7 @@ export function TourStudio({
               <button
                 type="button"
                 onClick={() => void replaceReel(selected.id)}
-                disabled={Boolean(busy) || blockingGeneration || !canReplace}
+                disabled={Boolean(busy) || generating || !canReplace}
                 className="mt-3 rounded-full bg-[var(--paper)] px-4 py-2 text-sm text-ink disabled:opacity-40"
               >
                 Replace this reel

@@ -298,7 +298,21 @@ export async function generateOneClip(
         );
         return;
       }
-      videoUrl = checked.videoUrl;
+      // Remember the finished URL and return. Downloading in this same request
+      // can die before the browser stores the tour, which looks like a new render.
+      await mutateTour(tourId, (current) => {
+        const target = current.clips.find((item) => item.id === clipId);
+        if (!target || target.video_path) return;
+        target.video_url = checked.videoUrl;
+        target.status = "submitted";
+        target.higgsfield_request_id = requestId;
+        target.error = null;
+        target.updated_at = new Date().toISOString();
+        current.tour.status = "generating";
+        current.tour.progress_label = "Shot finished. Saving the video…";
+        current.tour.updated_at = new Date().toISOString();
+      });
+      return;
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
       if (!/Higgsfield generation (failed|nsfw|canceled)/.test(message)) {
@@ -429,7 +443,44 @@ export async function resumeFailedStitch(tourId: string) {
   await run;
 }
 
-/** One short pass: submit anything missing, pick up finished Higgsfield shots, stitch when all are in. */
+async function rememberSavedClips(tourId: string) {
+  const record = await readTourRecord(tourId);
+  if (!record.clips.some((clip) => clip.video_path && clip.status !== "completed")) return;
+  await mutateTour(tourId, (current) => {
+    for (const clip of current.clips) {
+      if (!clip.video_path || clip.status === "completed") continue;
+      clip.status = "completed";
+      clip.error = null;
+      clip.updated_at = new Date().toISOString();
+    }
+  });
+}
+
+async function downloadSavedShot(tourId: string, clipId: string, videoUrl: string) {
+  const record = await readTourRecord(tourId);
+  const clip = record.clips.find((item) => item.id === clipId);
+  if (!clip || clip.video_path) return;
+  const storagePath = await writeClipBytes(tourId, clip.id, await downloadBinary(videoUrl));
+  await mutateTour(tourId, (current) => {
+    const target = current.clips.find((item) => item.id === clipId);
+    if (!target) return;
+    target.status = "completed";
+    target.video_path = storagePath;
+    target.error = null;
+    target.updated_at = new Date().toISOString();
+    const saved = current.clips.filter((item) => item.video_path).length;
+    current.tour.status = "generating";
+    current.tour.progress_label = `Saved shot ${saved} of ${current.clips.length}.`;
+    current.tour.error = null;
+    current.tour.updated_at = new Date().toISOString();
+  });
+}
+
+/**
+ * One durable step per request: note a finished Higgsfield URL, save that file,
+ * or stitch once every shot is already on disk. Never submits a new render when
+ * a request id or video URL is already stored.
+ */
 export async function advanceGeneratingTour(tourId: string) {
   const existing = advanceLocks.get(tourId);
   if (existing) {
@@ -442,23 +493,63 @@ export async function advanceGeneratingTour(tourId: string) {
     if (record.tour.status !== "generating" && record.tour.status !== "stitching") {
       return;
     }
-    const cache = photoUploadCache();
-    for (const clip of [...record.clips].sort((a, b) => a.sort_order - b.sort_order)) {
-      if (clip.status === "completed" && clip.video_path) continue;
-      try {
-        await generateOneClip(tourId, clip.id, cache, { wait: false });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Clip generation failed";
-        await mutateTour(tourId, (current) => {
-          const target = current.clips.find((item) => item.id === clip.id);
-          if (target && target.status !== "completed") {
-            target.status = "failed";
-            target.error = message;
-          }
-        });
-      }
+    await rememberSavedClips(tourId);
+    const fresh = await readTourRecord(tourId);
+    const pending = [...fresh.clips]
+      .filter((clip) => !clip.video_path)
+      .sort((a, b) => a.sort_order - b.sort_order);
+    if (pending.length === 0) {
+      await finishTourIfReady(tourId);
+      return;
     }
-    await finishTourIfReady(tourId);
+
+    const clip = pending[0]!;
+    try {
+      if (clip.video_url) {
+        await downloadSavedShot(tourId, clip.id, clip.video_url);
+      } else if (clip.camera_move === "photo_hold") {
+        await generateOneClip(tourId, clip.id, photoUploadCache(), { wait: true });
+      } else if (clip.higgsfield_request_id || clip.status === "pending") {
+        await generateOneClip(tourId, clip.id, photoUploadCache(), { wait: false });
+      } else {
+        await mutateTour(tourId, (current) => {
+          current.tour.status = "generating";
+          current.tour.progress_label = "Waiting for the saved shot. Nothing is being rendered again.";
+          current.tour.updated_at = new Date().toISOString();
+        });
+        return;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Clip generation failed";
+      if (!/Higgsfield generation (failed|nsfw|canceled)/.test(message)) {
+        await mutateTour(tourId, (current) => {
+          current.tour.status = "generating";
+          current.tour.progress_label = "Saving the finished shot. You can leave this page.";
+          current.tour.updated_at = new Date().toISOString();
+        });
+        return;
+      }
+      await mutateTour(tourId, (current) => {
+        const target = current.clips.find((item) => item.id === clip.id);
+        if (target && !target.video_path) {
+          target.status = "failed";
+          target.error = message;
+        }
+      });
+    }
+
+    const after = await readTourRecord(tourId);
+    if (after.clips.some((item) => item.status === "failed" && !item.video_path)) {
+      await finishTourIfReady(tourId);
+      return;
+    }
+    if (after.clips.length > 0 && after.clips.every((item) => item.video_path)) {
+      await mutateTour(tourId, (current) => {
+        current.tour.status = "stitching";
+        current.tour.progress_label = "Assembling the finished shots…";
+        current.tour.error = null;
+      });
+    }
   })().finally(() => {
     advanceLocks.delete(tourId);
   });
