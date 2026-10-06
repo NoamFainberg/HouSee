@@ -1,6 +1,14 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Clip, Photo, Tour, TourDetail } from "./types";
+import {
+  catalogTourIds,
+  fetchPublishedTour,
+  fetchRemoteFile,
+  publishTourRecord,
+  uploadTourBytes,
+  usesEphemeralDisk,
+} from "./vercel-tour-store";
 
 export type WalkthroughTransitionPlan = {
   from_photo_id: string;
@@ -32,9 +40,14 @@ export type TourRecord = {
   photos: Photo[];
   clips: Clip[];
   walkthrough_plan?: WalkthroughPlan;
+  /** Public file URLs used when the server disk does not persist (Vercel). */
+  remote_files?: Record<string, string>;
 };
 
-const DATA_ROOT = path.join(process.cwd(), "data", "tours");
+function dataRoot() {
+  if (usesEphemeralDisk()) return "/tmp/housee/tours";
+  return path.join(process.cwd(), "data", "tours");
+}
 
 function assertTourId(id: string) {
   if (!/^[0-9a-f-]{36}$/i.test(id)) {
@@ -44,7 +57,7 @@ function assertTourId(id: string) {
 
 export function tourDir(id: string) {
   assertTourId(id);
-  return path.join(DATA_ROOT, id);
+  return path.join(dataRoot(), id);
 }
 
 export function absoluteMediaPath(tourId: string, relativePath: string) {
@@ -60,7 +73,21 @@ export function mediaUrl(tourId: string, relativePath: string) {
   return `/api/media/${tourId}/${relativePath.split(path.sep).join("/")}`;
 }
 
+async function cacheTourRecord(record: TourRecord) {
+  const file = path.join(tourDir(record.tour.id), "tour.json");
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(record, null, 2)}\n`);
+}
+
 export async function readTourRecord(id: string): Promise<TourRecord> {
+  assertTourId(id);
+  if (usesEphemeralDisk()) {
+    const published = await fetchPublishedTour(id);
+    if (published) {
+      await cacheTourRecord(published);
+      return published;
+    }
+  }
   const file = path.join(tourDir(id), "tour.json");
   const raw = await readFile(file, "utf8");
   return JSON.parse(raw) as TourRecord;
@@ -83,10 +110,8 @@ export async function mutateTour<T>(
     const record = await readTourRecord(id);
     const result = await mutator(record);
     record.tour.updated_at = new Date().toISOString();
-    await writeFile(
-      path.join(tourDir(id), "tour.json"),
-      `${JSON.stringify(record, null, 2)}\n`,
-    );
+    await cacheTourRecord(record);
+    if (usesEphemeralDisk()) await publishTourRecord(record);
     return result;
   } finally {
     release(undefined);
@@ -112,18 +137,26 @@ export async function createTour(title: string): Promise<Tour> {
   await mkdir(path.join(dir, "photos"), { recursive: true });
   await mkdir(path.join(dir, "clips"), { recursive: true });
   const record: TourRecord = { tour, photos: [], clips: [] };
-  await writeFile(path.join(dir, "tour.json"), `${JSON.stringify(record, null, 2)}\n`);
+  await cacheTourRecord(record);
+  if (usesEphemeralDisk()) await publishTourRecord(record);
   return tour;
 }
 
 export async function listTours(): Promise<Tour[]> {
-  await mkdir(DATA_ROOT, { recursive: true });
-  const entries = await readdir(DATA_ROOT, { withFileTypes: true }).catch(() => []);
+  await mkdir(dataRoot(), { recursive: true });
+  const ids = new Set<string>();
+  if (usesEphemeralDisk()) {
+    for (const id of await catalogTourIds()) ids.add(id);
+  } else {
+    const entries = await readdir(dataRoot(), { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory()) ids.add(entry.name);
+    }
+  }
   const tours: Tour[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+  for (const id of ids) {
     try {
-      const record = await readTourRecord(entry.name);
+      const record = await readTourRecord(id);
       tours.push(record.tour);
     } catch {
       // skip incomplete folders
@@ -175,6 +208,10 @@ export async function addPhoto(
   const dest = absoluteMediaPath(tourId, storagePath);
   await mkdir(path.dirname(dest), { recursive: true });
   await writeFile(dest, bytes);
+  const normalizedPath = storagePath.split(path.sep).join("/");
+  const remoteUrl = usesEphemeralDisk()
+    ? await uploadTourBytes(normalizedPath, bytes, contentType)
+    : undefined;
   return mutateTour(tourId, (record) => {
     const nextOrder =
       record.photos.reduce((max, photo) => Math.max(max, photo.sort_order), -1) +
@@ -182,7 +219,7 @@ export async function addPhoto(
     const photo: Photo = {
       id: photoId,
       tour_id: tourId,
-      storage_path: storagePath.split(path.sep).join("/"),
+      storage_path: normalizedPath,
       original_filename: filename,
       room_type: "other",
       quality_score: null,
@@ -193,13 +230,36 @@ export async function addPhoto(
       created_at: new Date().toISOString(),
     };
     record.photos.push(photo);
+    if (remoteUrl) {
+      record.remote_files = { ...record.remote_files, [normalizedPath]: remoteUrl };
+    }
     record.tour.progress_label = "Photos uploaded";
     return photo;
   });
 }
 
+export async function readMediaBytes(
+  tourId: string,
+  relativePath: string,
+): Promise<Buffer> {
+  const normalized = relativePath.split(path.sep).join("/");
+  const local = absoluteMediaPath(tourId, normalized);
+  try {
+    return await readFile(local);
+  } catch (error) {
+    if (!usesEphemeralDisk()) throw error;
+    const record = await readTourRecord(tourId);
+    const url = record.remote_files?.[normalized];
+    if (!url) throw error;
+    const bytes = await fetchRemoteFile(url);
+    await mkdir(path.dirname(local), { recursive: true });
+    await writeFile(local, bytes);
+    return bytes;
+  }
+}
+
 export async function readPhotoBytes(photo: Photo): Promise<Buffer> {
-  return readFile(absoluteMediaPath(photo.tour_id, photo.storage_path));
+  return readMediaBytes(photo.tour_id, photo.storage_path);
 }
 
 export async function writeClipBytes(
@@ -210,6 +270,12 @@ export async function writeClipBytes(
   const storagePath = `clips/${clipId}.mp4`;
   await mkdir(path.join(tourDir(tourId), "clips"), { recursive: true });
   await writeFile(absoluteMediaPath(tourId, storagePath), bytes);
+  if (usesEphemeralDisk()) {
+    const remoteUrl = await uploadTourBytes(storagePath, bytes, "video/mp4");
+    await mutateTour(tourId, (record) => {
+      record.remote_files = { ...record.remote_files, [storagePath]: remoteUrl };
+    });
+  }
   return storagePath;
 }
 
@@ -218,6 +284,13 @@ export async function writeMasterBytes(
   bytes: Buffer,
 ): Promise<string> {
   const storagePath = "master.mp4";
+  await mkdir(tourDir(tourId), { recursive: true });
   await writeFile(absoluteMediaPath(tourId, storagePath), bytes);
+  if (usesEphemeralDisk()) {
+    const remoteUrl = await uploadTourBytes(storagePath, bytes, "video/mp4");
+    await mutateTour(tourId, (record) => {
+      record.remote_files = { ...record.remote_files, [storagePath]: remoteUrl };
+    });
+  }
   return storagePath;
 }

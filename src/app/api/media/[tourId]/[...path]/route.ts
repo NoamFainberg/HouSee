@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { absoluteMediaPath } from "@/lib/store";
+import { readMediaBytes } from "@/lib/store";
 
 export const runtime = "nodejs";
 
@@ -23,9 +22,8 @@ export async function GET(_request: NextRequest, context: RouteCtx) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     const relative = segments.join("/");
-    const filePath = absoluteMediaPath(tourId, relative);
-    const bytes = await readFile(filePath);
-    const ext = path.extname(filePath).toLowerCase();
+    const bytes = await readMediaBytes(tourId, relative);
+    const ext = path.extname(relative).toLowerCase();
     return new NextResponse(new Uint8Array(bytes), {
       headers: {
         "Content-Type": TYPES[ext] ?? "application/octet-stream",

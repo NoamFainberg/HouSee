@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
-import { absoluteMediaPath, readTourRecord, writeMasterBytes } from "./store";
+import { readMediaBytes, readTourRecord, writeMasterBytes } from "./store";
 import type { Clip } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -196,7 +196,7 @@ export async function stitchTour(tourId: string): Promise<string> {
     for (const [index, clip] of clips.entries()) {
       const rawPath = join(work, `raw-${index}.mp4`);
       const normalizedPath = join(work, `clip-${index}.mp4`);
-      await copyFile(absoluteMediaPath(tourId, clip.video_path!), rawPath);
+      await writeFile(rawPath, await readMediaBytes(tourId, clip.video_path!));
       if (clip.camera_move === "photo_hold") {
         await normalizeHoldClip(rawPath, normalizedPath);
       } else {
