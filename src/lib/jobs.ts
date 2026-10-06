@@ -21,15 +21,19 @@ export async function startTourGeneration(
   });
 }
 
-export async function startClipRetry(tourId: string, clipId: string) {
+export async function startClipRetry(
+  tourId: string,
+  clipId: string,
+  note?: string,
+) {
   if (pipelineDriver() === "inngest") {
     await inngest.send({
       name: "clip/retry",
-      data: { tourId, clipId },
+      data: { tourId, clipId, note },
     });
     return;
   }
-  void retryClipAndMaybeStitch(tourId, clipId).catch((error) => {
+  void retryClipAndMaybeStitch(tourId, clipId, note).catch((error) => {
     console.error("Inline clip retry failed", error);
   });
 }

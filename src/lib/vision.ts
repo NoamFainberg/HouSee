@@ -1,4 +1,5 @@
 import sharp from "sharp";
+import { composeDroneBlendPrompt } from "./blend-prompt";
 import {
   CINEMATIC_PROMPT_PREFIX,
   inferRoomFromFilename,
@@ -159,36 +160,21 @@ export function tuneTransitionPrompt(
       (degrees !== null && degrees > 45));
 
   const avoid = [...new Set([...edge.avoid, ...WALL_SAFE_AVOID])];
-  const dronePath =
-    "Smooth interior drone gimbal glide at chest height along visible open floor space — gentle forward arc, slow float. All walls, door frames, and ceiling edges stay solid; never clip through surfaces.";
-
-  if (!needsConservative) {
-    return {
-      ...edge,
-      avoid,
-      camera_path: edge.camera_path || dronePath,
-      higgsfield_prompt: finalizeHiggsfieldPrompt(
-        edge.higgsfield_prompt,
-        edge.shared_elements,
-        edge.camera_path || dronePath,
-        avoid,
-      ),
-    };
-  }
-
-  const cameraPath = `${dronePath} Stay inside the visible room volume — no shortcuts through walls or closed doors.`;
-  const basePrompt = `${CINEMATIC_PROMPT_PREFIX} Drone flyby morph inside the same room. ${edge.spatial_relationship || "Glide along open floor space."} ${edge.shared_elements.slice(0, 3).join(", ") || "Floor plane and walls"} remain fixed anchors — never clip through solid walls or furniture.`;
+  const dronePath = needsConservative
+    ? "Slow chest-height drone glide inside the visible room volume only. No shortcuts through walls or closed doors."
+    : edge.camera_path ||
+      "Slow chest-height gimbal float along visible open floor, gentle arc, then settle.";
 
   return {
     ...edge,
-    camera_path: cameraPath,
+    camera_path: dronePath,
     avoid,
-    higgsfield_prompt: finalizeHiggsfieldPrompt(
-      basePrompt,
-      edge.shared_elements,
-      cameraPath,
+    higgsfield_prompt: composeDroneBlendPrompt({
+      spatial: edge.spatial_relationship,
+      shared: edge.shared_elements,
+      cameraPath: dronePath,
       avoid,
-    ),
+    }),
   };
 }
 
@@ -897,6 +883,161 @@ export async function enrichTransitionPrompts(tourId: string): Promise<void> {
   for (const clip of transitionClips) {
     await enrichClipPrompt(tourId, clip.id);
   }
+}
+
+function revisionVisionPrompt(note: string, currentPrompt: string): string {
+  return `You are repairing one shot in a photoreal interior drone tour.
+
+The user watched this reel and said what is wrong:
+"${note}"
+
+Current prompt:
+${currentPrompt || "(none)"}
+
+Study START and END. Rewrite the camera path so the shot is one continuous drone blend from START to END inside the real room.
+
+Rules that cannot be broken:
+- Opening frame must match START. Closing frame must match END, then hold.
+- Never pass through walls, closed doors, windows, or furniture.
+- Do not invent rooms, hallways, windows, or doorways.
+- If the note mentions a jump, the move must be one slow glide that lands on END.
+- If the note mentions walls, route only through open floor already visible in START.
+- Keep the user's sequence. Do not swap START and END.
+
+Return JSON only:
+{"spatial_relationship":"how the two photos connect","camera_path":"the corrected drone move","shared_elements":["anchors visible in both"]}`;
+}
+
+function parseRevision(raw: string): {
+  spatial_relationship: string;
+  camera_path: string;
+  shared_elements: string[];
+} {
+  const empty = { spatial_relationship: "", camera_path: "", shared_elements: [] as string[] };
+  try {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return empty;
+    const parsed = JSON.parse(match[0]) as {
+      spatial_relationship?: string;
+      camera_path?: string;
+      shared_elements?: string[];
+    };
+    return {
+      spatial_relationship: parsed.spatial_relationship?.trim() ?? "",
+      camera_path: parsed.camera_path?.trim() ?? "",
+      shared_elements: Array.isArray(parsed.shared_elements)
+        ? parsed.shared_elements.map(String).slice(0, 4)
+        : [],
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/** Rebuild blend edges so the user's photo order is the walkthrough sequence. */
+export async function refreshPlanForUserSequence(tourId: string): Promise<void> {
+  const record = await readTourRecord(tourId);
+  const included = record.photos
+    .filter((photo) => !photo.rejected)
+    .sort((a, b) => a.sort_order - b.sort_order);
+  if (included.length < 2) return;
+
+  const plan = await rebuildWalkthroughPlanForOrder(
+    included,
+    record.walkthrough_plan,
+  );
+  await mutateTour(tourId, (current) => {
+    current.walkthrough_plan = plan;
+    current.tour.progress_label = "Sequence locked. Building drone blends…";
+  });
+}
+
+/**
+ * Rewrite one reel from the user's description, then keep walkthrough guardrails.
+ * The start and end photos stay the same so the rest of the tour still connects.
+ */
+export async function reviseClipFromFeedback(
+  tourId: string,
+  clipId: string,
+  note: string,
+): Promise<string> {
+  const trimmed = note.trim();
+  if (trimmed.length < 8) {
+    throw new Error("Describe what is wrong with this reel.");
+  }
+  if (trimmed.length > 400) {
+    throw new Error("Keep the note under 400 characters.");
+  }
+
+  const record = await readTourRecord(tourId);
+  const clip = record.clips.find((item) => item.id === clipId);
+  if (!clip?.photo_id || !clip.end_photo_id) {
+    throw new Error("This reel has no blend to replace. Build the reel first.");
+  }
+  const start = record.photos.find((photo) => photo.id === clip.photo_id);
+  const end = record.photos.find((photo) => photo.id === clip.end_photo_id);
+  if (!start || !end) throw new Error("Start or end photo is missing.");
+
+  const edge = record.walkthrough_plan?.transitions.find(
+    (item) =>
+      item.from_photo_id === start.id && item.to_photo_id === end.id,
+  );
+
+  let spatial = edge?.spatial_relationship ?? "";
+  let cameraPath = edge?.camera_path ?? "";
+  let shared = edge?.shared_elements ?? [];
+
+  if (hasVisionEnv()) {
+    try {
+      const [startBase64, endBase64] = await Promise.all([
+        imageToJpegBase64(await readPhotoBytes(start), 640),
+        imageToJpegBase64(await readPhotoBytes(end), 640),
+      ]);
+      const raw = await callVision(
+        revisionVisionPrompt(trimmed, clip.prompt ?? ""),
+        [
+          { label: "START photo (opening frame):", base64: startBase64 },
+          { label: "END photo (closing frame):", base64: endBase64 },
+        ],
+        visionPlanningModel(),
+      );
+      const parsed = parseRevision(raw);
+      if (parsed.spatial_relationship) spatial = parsed.spatial_relationship;
+      if (parsed.camera_path) cameraPath = parsed.camera_path;
+      if (parsed.shared_elements.length) shared = parsed.shared_elements;
+    } catch (error) {
+      console.warn("Clip revision vision failed", error);
+    }
+  }
+
+  const prompt = composeDroneBlendPrompt({
+    spatial,
+    shared,
+    cameraPath,
+    avoid: edge?.avoid,
+    revision: trimmed,
+  });
+
+  await mutateTour(tourId, (current) => {
+    const target = current.clips.find((item) => item.id === clipId);
+    if (target) {
+      target.prompt = prompt;
+      target.revision_note = trimmed;
+      target.updated_at = new Date().toISOString();
+    }
+    const planEdge = current.walkthrough_plan?.transitions.find(
+      (item) =>
+        item.from_photo_id === start.id && item.to_photo_id === end.id,
+    );
+    if (planEdge) {
+      planEdge.higgsfield_prompt = prompt;
+      planEdge.camera_path = cameraPath || planEdge.camera_path;
+      planEdge.spatial_relationship = spatial || planEdge.spatial_relationship;
+      if (shared.length) planEdge.shared_elements = shared;
+    }
+  });
+
+  return prompt;
 }
 
 export async function curateTourPhotos(tourId: string) {
