@@ -1,4 +1,4 @@
-import type { RoomType } from "./types";
+import type { Photo, RoomType } from "./types";
 
 export const WALKTHROUGH_ORDER: RoomType[] = [
   "exterior",
@@ -31,7 +31,7 @@ export const ROOM_LABELS: Record<RoomType, string> = {
 };
 
 const CINEMATIC =
-  "Photoreal cinematic real-estate walkthrough, 24mm gimbal, natural light, locked architecture, no people, no morphing walls, no extra furniture, no text overlay, no walking figures, no new doorways, no disappearing walls, geometry stays fixed.";
+  "Photoreal cinematic interior drone flyby, smooth gimbal float at chest height, natural light, locked architecture, no people, no morphing walls, no extra furniture, no text overlay, no walking figures, no new doorways, no disappearing walls, geometry stays fixed, never clip through walls or doors";
 
 export const CINEMATIC_PROMPT_PREFIX = CINEMATIC;
 
@@ -100,6 +100,42 @@ export function isRoomType(value: string): value is RoomType {
   return (WALKTHROUGH_ORDER as string[]).includes(value);
 }
 
+/** Semantic view angles for same-room drone flyby ordering. */
+export type ViewAngleRole =
+  | "corner"
+  | "entrance_overview"
+  | "left_view"
+  | "other";
+
+export const VIEW_ANGLE_WALK_ORDER: ViewAngleRole[] = [
+  "corner",
+  "entrance_overview",
+  "left_view",
+  "other",
+];
+
+export type SameRoomViewRole = "establish" | "feature" | "detail";
+
+export function inferSameRoomViewRole(filename: string): SameRoomViewRole | null {
+  const n = filename.toLowerCase();
+  if (/tv|01-living|establish|hero|wide/.test(n)) return "establish";
+  if (/window|02-living|curtain|drape/.test(n)) return "feature";
+  if (/seating|sofa|03-living|lounge/.test(n)) return "detail";
+  return null;
+}
+
+export function orderPhotosByViewAngles(
+  photos: Photo[],
+  roles: ViewAngleRole[],
+): Photo[] {
+  const ranked = photos.map((photo, index) => ({
+    photo,
+    rank: VIEW_ANGLE_WALK_ORDER.indexOf(roles[index] ?? "other"),
+  }));
+  ranked.sort((a, b) => a.rank - b.rank);
+  return ranked.map((item) => item.photo);
+}
+
 export function inferRoomFromFilename(filename: string): RoomType {
   const n = filename.toLowerCase();
   if (/floor.?plan|layout|blueprint|plattegrond/.test(n)) return "floorplan";
@@ -118,7 +154,7 @@ export function inferRoomFromFilename(filename: string): RoomType {
 
 export function sameRoomAnglePrompt(room: RoomType): string {
   const label = ROOM_LABELS[room].toLowerCase();
-  return `${CINEMATIC} Hold inside the ${label} shown in the photo. Slow cinematic orbit or gentle lateral pan only — no forward walk, no passing through walls, no invented doorways or new rooms. Walls, ceiling, and furniture stay fixed; only the camera moves within the visible space.`;
+  return `${CINEMATIC} Smooth drone gimbal glide inside the ${label}, floating along visible open floor space. Gentle arc forward — walls, doors, and furniture stay fixed; never clip through solid surfaces.`;
 }
 
 export function transitionPrompt(from: RoomType, to: RoomType): string {
@@ -127,7 +163,7 @@ export function transitionPrompt(from: RoomType, to: RoomType): string {
   }
   const fromLabel = ROOM_LABELS[from].toLowerCase();
   const toLabel = ROOM_LABELS[to].toLowerCase();
-  return `${CINEMATIC} One continuous steadicam move from the ${fromLabel} into the ${toLabel}. Opening frame matches the first photo exactly; closing frame matches the second photo exactly. Use only doorways, hallways, or sightlines visible in the opening frame — never pass through solid walls or invent new openings. No people, stable architecture, no morphing geometry.`;
+  return `${CINEMATIC} One continuous interior drone flyby from the ${fromLabel} toward the ${toLabel}. Opening frame matches the first photo exactly; closing frame matches the second photo exactly. Glide along open floor space visible in the opening frame — never clip through walls or invent openings. No people, stable architecture, no morphing geometry.`;
 }
 
 export function clipLabel(from: RoomType, to?: RoomType): string {

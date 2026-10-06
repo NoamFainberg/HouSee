@@ -27,7 +27,11 @@ export const retryClipFn = inngest.createFunction(
   async ({ event, step }) => {
     const tourId = event.data.tourId as string;
     const clipId = event.data.clipId as string;
-    await step.run("retry-clip", () => retryClipAndMaybeStitch(tourId, clipId));
+    const note =
+      typeof event.data.note === "string" ? event.data.note : undefined;
+    await step.run("retry-clip", () =>
+      retryClipAndMaybeStitch(tourId, clipId, note),
+    );
     return { tourId, clipId };
   },
 );

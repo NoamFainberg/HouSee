@@ -1,10 +1,15 @@
 import sharp from "sharp";
+import { composeDroneBlendPrompt } from "./blend-prompt";
 import {
   CINEMATIC_PROMPT_PREFIX,
   inferRoomFromFilename,
+  inferSameRoomViewRole,
   isRoomType,
+  orderPhotosByViewAngles,
   ROOM_LABELS,
   transitionPrompt,
+  VIEW_ANGLE_WALK_ORDER,
+  type ViewAngleRole,
 } from "./rooms";
 import type { WalkthroughPlan, WalkthroughTransitionPlan } from "./store";
 import { mutateTour, readPhotoBytes, readTourRecord } from "./store";
@@ -46,15 +51,15 @@ quality is 0-1: prefer wide, well-lit, straight-on interior/exterior photos.
 Return JSON only.`;
 
 function walkthroughPlanPrompt(photoCount: number): string {
-  return `You are a cinematographer and spatial-reasoning planner for a real-estate walkthrough video.
+  return `You are a cinematographer planning a seamless interior DRONE FLYBY tour — a smooth gimbal float through a living room, never teleporting.
 
-You receive ${photoCount} photographs of the same property, possibly the same room from different positions. Study ALL images together before deciding anything.
+You receive ${photoCount} photographs of the same room from different positions. Study ALL images together before deciding anything.
 
 Your tasks:
-1. Identify anchor elements that repeat across photos (floor material, ceiling lights, specific sofa, TV, window wall, etc.)
-2. Infer how the camera positions relate in real space (e.g. "photo 1 faces the TV wall; photo 2 is panned left toward the window")
-3. Order the photos into a walk sequence where each consecutive step could be filmed by a real camera move without passing through walls
-4. For each consecutive pair in that sequence, write the exact Higgsfield image-to-video morph prompt
+1. Classify each photo: corner (salon corner near door/wall), entrance_overview (wide layout from entrance), left_view (room seen from the left toward seating/window)
+2. Order photos for the flyby: corner FIRST → entrance_overview SECOND → left_view THIRD (adjust if fewer angles)
+3. For every consecutive pair, list shared_elements visible in BOTH frames (lock geometry during morph and stitch seams)
+4. Write Higgsfield morph prompts: smooth drone glide along open floor space; clip N lands on photo N+1 for a seamless cut
 
 Return JSON only:
 {
@@ -85,30 +90,50 @@ Return JSON only:
 }
 
 CRITICAL RULES:
+- sequence[0] = corner/salon angle; sequence[1] = entrance overview (widest layout); sequence[2] = left-side view — NEVER reverse this narrative
 - sequence must list every non-rejected photo index exactly once (${photoCount} indices total, 0-based)
-- can_blend=true ONLY when shared_elements are genuinely visible in BOTH frames and a real camera move could connect them without hallucination
+- can_blend=true ONLY when shared_elements are genuinely visible in BOTH frames and a drone could glide between them without clipping walls
 - higgsfield_prompt MUST begin with: "${CINEMATIC_PROMPT_PREFIX}"
-- Opening frame must match from_index exactly; closing frame must match to_index exactly
-- Motion stays inside visible geometry — NEVER pass through solid walls, NEVER add doorways/windows/people/cameras/tripods not in the start frame
-- Reference shared anchors by name so the model locks geometry
-- Forbidden words in higgsfield_prompt: "walk through door" unless that exact opening is visible in the start frame
-- If two views cannot connect without hallucination, set can_blend=false and explain why
+- Opening frame must match from_index exactly; closing frame must match to_index exactly and HOLD on it
+- Describe a smooth drone gimbal glide along visible open floor space — gentle arc, chest height, NOT a locked tripod pan
+- NEVER pass through solid walls, doors, or furniture; name walls/door frames in START that must stay closed
+- If two views cannot connect without clipping geometry, set can_blend=false
 - Keep each higgsfield_prompt under 420 characters
-- room_type must be one of: exterior, entry, living, kitchen, dining, bedroom, bathroom, balcony, view, amenity, other, floorplan
-- Same-room wide rotation (>25° between views): use locked tripod, yaw-only, max 20° pan — NEVER translate the camera through the room or pass through walls/door frames visible in START
-- Name solid walls and door frames in START that must stay closed and fixed`;
+- room_type must be one of: exterior, entry, living, kitchen, dining, bedroom, bathroom, balcony, view, amenity, other, floorplan`;
 }
 
-const CONSERVATIVE_MORPH_AVOID = [
+const WALL_SAFE_AVOID = [
   "passing through walls",
-  "opening doors",
-  "forward dolly",
-  "translating camera",
-  "walking through doorways",
+  "clip through geometry",
+  "moving walls",
+  "invented doorways",
+  "flying through doors",
   "people",
   "cameras",
   "equipment",
+];
+
+function classifyViewAnglesPrompt(count: number): string {
+  return `Classify ${count} living-room photos for a drone flyby tour.
+
+For each image index (0-based) assign view_angle:
+- corner: salon corner near door/wall junction, intimate partial view
+- entrance_overview: wide overview from entrance showing most of the room layout (often deeper/wider perspective)
+- left_view: camera on the left side of the room looking toward seating/window area
+- other: none of the above
+
+Return JSON only:
+{"photos":[{"index":0,"view_angle":"corner","summary":"one line"}]}
+
+Tour playback order is always: corner → entrance_overview → left_view → other.`;
+}
+
+const CONSERVATIVE_MORPH_AVOID = [
+  ...WALL_SAFE_AVOID,
+  "opening doors",
+  "walking through doorways",
   "flying doors",
+  "shortcut through furniture",
 ];
 
 function parsePanDegrees(cameraPath: string): number | null {
@@ -124,29 +149,32 @@ export function tuneTransitionPrompt(
 ): WalkthroughTransitionPlan {
   const sameRoom = start.room_type === end.room_type;
   const degrees = parsePanDegrees(edge.camera_path);
+  const establishToNext =
+    inferSameRoomViewRole(start.original_filename ?? "") === "establish" &&
+    inferSameRoomViewRole(end.original_filename ?? "") === "feature";
   const needsConservative =
     sameRoom &&
-    (transitionIndex === 0 || (degrees !== null && degrees > 25));
+    (!edge.can_blend ||
+      edge.connection_score < 0.7 ||
+      establishToNext ||
+      (degrees !== null && degrees > 45));
 
-  if (!needsConservative) {
-    return edge;
-  }
-
-  const avoid = [...new Set([...edge.avoid, ...CONSERVATIVE_MORPH_AVOID])];
-  const cameraPath =
-    "Locked tripod, yaw-only rotation, max 20-degree horizontal pan. Zero forward motion, zero lateral travel. All walls and door frames stay closed and fixed.";
-  const basePrompt = `${CINEMATIC_PROMPT_PREFIX} Morph from opening frame to closing frame inside the same room. ${edge.spatial_relationship || "Stay inside visible geometry."} Walls, door frames, and ceiling edges remain solid — only a slow horizontal turn on a locked tripod, never passing through walls or open doorways.`;
+  const avoid = [...new Set([...edge.avoid, ...WALL_SAFE_AVOID])];
+  const dronePath = needsConservative
+    ? "Slow chest-height drone glide inside the visible room volume only. No shortcuts through walls or closed doors."
+    : edge.camera_path ||
+      "Slow chest-height gimbal float along visible open floor, gentle arc, then settle.";
 
   return {
     ...edge,
-    camera_path: cameraPath,
+    camera_path: dronePath,
     avoid,
-    higgsfield_prompt: finalizeHiggsfieldPrompt(
-      basePrompt,
-      edge.shared_elements,
-      cameraPath,
+    higgsfield_prompt: composeDroneBlendPrompt({
+      spatial: edge.spatial_relationship,
+      shared: edge.shared_elements,
+      cameraPath: dronePath,
       avoid,
-    ),
+    }),
   };
 }
 
@@ -156,31 +184,29 @@ function transitionVisionPrompt(fromLabel: string, toLabel: string): string {
     ? `Both frames are the SAME room (${fromLabel}) from different camera positions. Do NOT plan a walk into another space.`
     : `Image START is ${fromLabel}. Image END is ${toLabel}. Plan a move only through architecture visible in START.`;
 
-  return `You are a cinematographer planning a seamless image-to-image video morph for a real-estate walkthrough.
+  return `You are a cinematographer planning a seamless drone flyby morph between two frames.
 
 ${roomContext}
 
 Study both photos carefully:
 - Identify shared architecture: floors, walls, windows, furniture, sightlines
-- ${sameRoom ? "Choose an in-room orbit, pan, or lateral dolly — the camera never leaves the visible volume and never passes through walls." : "Determine if END is visible from START through a real doorway or hallway already in frame"}
-- Never invent doors, windows, hallways, or rooms that are not visible in START
+- Plan a smooth interior drone gimbal glide along visible open floor space — chest height, gentle arc
+- The drone NEVER clips through walls, doors, or furniture; never invent openings
 
 Return JSON only:
 {
   "connection_score": 0.0,
   "shared_elements": ["elements visible in both frames"],
-  "camera_path": "one sentence describing the exact in-room or through-opening camera move",
-  "avoid": ["hallucinated doorways", "walking through walls", "invented rooms"],
+  "camera_path": "one sentence describing the drone glide path along open floor space",
+  "avoid": ["passing through walls", "clip through geometry", "invented doorways"],
   "higgsfield_prompt": "complete prompt for the video model"
 }
 
 Rules for higgsfield_prompt:
 - Must begin with: "${CINEMATIC_PROMPT_PREFIX}"
 - Opening frame must match START exactly; closing frame must match END exactly
-- ${sameRoom ? "Describe ONLY a slow orbit, pan, or lateral move inside the same room. Forbidden: forward walk, passing through walls, new doorways, morphing layout." : "Describe ONLY motion through openings already visible in START toward END. If no real opening connects them, use a slow pan/dolly that stays inside START geometry."}
-- Never say "walk through a door" unless that exact opening is visible in START
-- Explicitly forbid: passing through walls, inventing hallways, adding furniture, morphing walls
-- No people, no text overlays, stable walls and furniture
+- ${sameRoom ? "Describe a smooth drone gimbal float along open floor space inside the room. Forbidden: clipping through walls, moving walls, new doorways." : "Glide through openings already visible in START toward END only."}
+- Name shared anchors and solid walls that must stay fixed
 - Keep higgsfield_prompt under 450 characters`;
 }
 
@@ -330,6 +356,7 @@ function finalizeHiggsfieldPrompt(
   if (avoid.length > 0) {
     next = `${next} Avoid: ${avoid.slice(0, 4).join(", ")}.`;
   }
+  next = `${next} End by holding the closing frame on shared anchors for a seamless cut to the next shot.`;
   if (next.length > 900) {
     next = `${next.slice(0, 897)}…`;
   }
@@ -500,6 +527,166 @@ export async function planWalkthroughSequence(
   }
 
   return plan;
+}
+
+export function sameRoomSet(photos: Photo[]): boolean {
+  return (
+    photos.length >= 3 &&
+    photos.every((photo) => photo.room_type === photos[0]!.room_type)
+  );
+}
+
+function photoViewsFromRoles(
+  ordered: Photo[],
+  uploadOrdered: Photo[],
+  viewRoles: ViewAngleRole[],
+): WalkthroughPlan["photo_views"] {
+  return ordered.map((photo) => {
+    const uploadIndex = uploadOrdered.findIndex((item) => item.id === photo.id);
+    return {
+      photo_id: photo.id,
+      view_angle: viewRoles[uploadIndex] ?? "other",
+    };
+  });
+}
+
+function parseViewAngleRoles(
+  raw: string,
+  count: number,
+): ViewAngleRole[] {
+  const fallback = Array<ViewAngleRole>(count).fill("other");
+  try {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    const parsed = JSON.parse(match[0]) as {
+      photos?: { index?: number; view_angle?: string }[];
+    };
+    const roles = [...fallback];
+    for (const item of parsed.photos ?? []) {
+      const index = Number(item.index);
+      const angle = item.view_angle;
+      if (
+        Number.isInteger(index) &&
+        index >= 0 &&
+        index < count &&
+        VIEW_ANGLE_WALK_ORDER.includes(angle as ViewAngleRole)
+      ) {
+        roles[index] = angle as ViewAngleRole;
+      }
+    }
+    return roles;
+  } catch {
+    return fallback;
+  }
+}
+
+async function classifySameRoomViewAngles(
+  photos: Photo[],
+): Promise<ViewAngleRole[]> {
+  if (!hasVisionEnv() || photos.length === 0) {
+    return photos.map(() => "other" as ViewAngleRole);
+  }
+
+  const images = await Promise.all(
+    photos.map(async (photo, index) => ({
+      label: `Photo index ${index}${photo.original_filename ? ` (${photo.original_filename})` : ""}:`,
+      base64: await imageToJpegBase64(await readPhotoBytes(photo), 768),
+    })),
+  );
+
+  try {
+    const raw = await callVision(
+      classifyViewAnglesPrompt(photos.length),
+      images,
+      visionPlanningModel(),
+    );
+    return parseViewAngleRoles(raw, photos.length);
+  } catch (error) {
+    console.warn("View angle classification failed", error);
+    return photos.map(() => "other" as ViewAngleRole);
+  }
+}
+
+/** Order same-room photos: salon corner → entrance overview → left view. */
+async function refineSameRoomWalkOrder(
+  photos: Photo[],
+  plan: WalkthroughPlan,
+): Promise<{ ordered: Photo[]; plan: WalkthroughPlan }> {
+  const byId = new Map(photos.map((photo) => [photo.id, photo]));
+
+  if (!sameRoomSet(photos)) {
+    const ordered = plan.photo_sequence
+      .map((id) => byId.get(id))
+      .filter((photo): photo is Photo => Boolean(photo));
+    return {
+      ordered: ordered.length === photos.length ? ordered : photos,
+      plan,
+    };
+  }
+
+  const uploadOrdered = [...photos].sort((a, b) => a.sort_order - b.sort_order);
+  const viewRoles = await classifySameRoomViewAngles(uploadOrdered);
+  const ordered = orderPhotosByViewAngles(uploadOrdered, viewRoles);
+
+  const photo_views = photoViewsFromRoles(ordered, uploadOrdered, viewRoles);
+  const orderChanged = ordered.some(
+    (photo, index) => photo.id !== plan.photo_sequence[index],
+  );
+  if (!orderChanged) {
+    return { ordered, plan: { ...plan, photo_views } };
+  }
+
+  const rebuilt = await rebuildWalkthroughPlanForOrder(ordered, plan);
+  return {
+    ordered,
+    plan: { ...rebuilt, photo_views },
+  };
+}
+
+export async function rebuildWalkthroughPlanForOrder(
+  photos: Photo[],
+  existing?: WalkthroughPlan,
+): Promise<WalkthroughPlan> {
+  const transitions: WalkthroughTransitionPlan[] = [];
+  for (let index = 0; index < photos.length - 1; index += 1) {
+    const start = photos[index]!;
+    const end = photos[index + 1]!;
+    const existingEdge = existing?.transitions.find(
+      (item) =>
+        item.from_photo_id === start.id && item.to_photo_id === end.id,
+    );
+    if (existingEdge) {
+      transitions.push(existingEdge);
+      continue;
+    }
+    const pair = await planTransitionPair(start, end);
+    transitions.push(
+      tuneTransitionPrompt(
+        {
+          from_photo_id: start.id,
+          to_photo_id: end.id,
+          connection_score: pair.connection_score,
+          spatial_relationship: pair.camera_path,
+          shared_elements: pair.shared_elements,
+          camera_path: pair.camera_path,
+          can_blend: pair.connection_score >= 0.45,
+          avoid: ["invented doorways", "people", "cameras", "moving walls"],
+          higgsfield_prompt: pair.higgsfield_prompt,
+        },
+        index,
+        start,
+        end,
+      ),
+    );
+  }
+
+  return {
+    scene_summary: existing?.scene_summary ?? "",
+    photo_sequence: photos.map((photo) => photo.id),
+    photo_views: existing?.photo_views,
+    transitions,
+    analyzed_at: new Date().toISOString(),
+  };
 }
 
 function parseTransitionPlan(raw: string, fallback: string): TransitionPlan {
@@ -698,6 +885,161 @@ export async function enrichTransitionPrompts(tourId: string): Promise<void> {
   }
 }
 
+function revisionVisionPrompt(note: string, currentPrompt: string): string {
+  return `You are repairing one shot in a photoreal interior drone tour.
+
+The user watched this reel and said what is wrong:
+"${note}"
+
+Current prompt:
+${currentPrompt || "(none)"}
+
+Study START and END. Rewrite the camera path so the shot is one continuous drone blend from START to END inside the real room.
+
+Rules that cannot be broken:
+- Opening frame must match START. Closing frame must match END, then hold.
+- Never pass through walls, closed doors, windows, or furniture.
+- Do not invent rooms, hallways, windows, or doorways.
+- If the note mentions a jump, the move must be one slow glide that lands on END.
+- If the note mentions walls, route only through open floor already visible in START.
+- Keep the user's sequence. Do not swap START and END.
+
+Return JSON only:
+{"spatial_relationship":"how the two photos connect","camera_path":"the corrected drone move","shared_elements":["anchors visible in both"]}`;
+}
+
+function parseRevision(raw: string): {
+  spatial_relationship: string;
+  camera_path: string;
+  shared_elements: string[];
+} {
+  const empty = { spatial_relationship: "", camera_path: "", shared_elements: [] as string[] };
+  try {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return empty;
+    const parsed = JSON.parse(match[0]) as {
+      spatial_relationship?: string;
+      camera_path?: string;
+      shared_elements?: string[];
+    };
+    return {
+      spatial_relationship: parsed.spatial_relationship?.trim() ?? "",
+      camera_path: parsed.camera_path?.trim() ?? "",
+      shared_elements: Array.isArray(parsed.shared_elements)
+        ? parsed.shared_elements.map(String).slice(0, 4)
+        : [],
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/** Rebuild blend edges so the user's photo order is the walkthrough sequence. */
+export async function refreshPlanForUserSequence(tourId: string): Promise<void> {
+  const record = await readTourRecord(tourId);
+  const included = record.photos
+    .filter((photo) => !photo.rejected)
+    .sort((a, b) => a.sort_order - b.sort_order);
+  if (included.length < 2) return;
+
+  const plan = await rebuildWalkthroughPlanForOrder(
+    included,
+    record.walkthrough_plan,
+  );
+  await mutateTour(tourId, (current) => {
+    current.walkthrough_plan = plan;
+    current.tour.progress_label = "Sequence locked. Building drone blends…";
+  });
+}
+
+/**
+ * Rewrite one reel from the user's description, then keep walkthrough guardrails.
+ * The start and end photos stay the same so the rest of the tour still connects.
+ */
+export async function reviseClipFromFeedback(
+  tourId: string,
+  clipId: string,
+  note: string,
+): Promise<string> {
+  const trimmed = note.trim();
+  if (trimmed.length < 8) {
+    throw new Error("Describe what is wrong with this reel.");
+  }
+  if (trimmed.length > 400) {
+    throw new Error("Keep the note under 400 characters.");
+  }
+
+  const record = await readTourRecord(tourId);
+  const clip = record.clips.find((item) => item.id === clipId);
+  if (!clip?.photo_id || !clip.end_photo_id) {
+    throw new Error("This reel has no blend to replace. Build the reel first.");
+  }
+  const start = record.photos.find((photo) => photo.id === clip.photo_id);
+  const end = record.photos.find((photo) => photo.id === clip.end_photo_id);
+  if (!start || !end) throw new Error("Start or end photo is missing.");
+
+  const edge = record.walkthrough_plan?.transitions.find(
+    (item) =>
+      item.from_photo_id === start.id && item.to_photo_id === end.id,
+  );
+
+  let spatial = edge?.spatial_relationship ?? "";
+  let cameraPath = edge?.camera_path ?? "";
+  let shared = edge?.shared_elements ?? [];
+
+  if (hasVisionEnv()) {
+    try {
+      const [startBase64, endBase64] = await Promise.all([
+        imageToJpegBase64(await readPhotoBytes(start), 640),
+        imageToJpegBase64(await readPhotoBytes(end), 640),
+      ]);
+      const raw = await callVision(
+        revisionVisionPrompt(trimmed, clip.prompt ?? ""),
+        [
+          { label: "START photo (opening frame):", base64: startBase64 },
+          { label: "END photo (closing frame):", base64: endBase64 },
+        ],
+        visionPlanningModel(),
+      );
+      const parsed = parseRevision(raw);
+      if (parsed.spatial_relationship) spatial = parsed.spatial_relationship;
+      if (parsed.camera_path) cameraPath = parsed.camera_path;
+      if (parsed.shared_elements.length) shared = parsed.shared_elements;
+    } catch (error) {
+      console.warn("Clip revision vision failed", error);
+    }
+  }
+
+  const prompt = composeDroneBlendPrompt({
+    spatial,
+    shared,
+    cameraPath,
+    avoid: edge?.avoid,
+    revision: trimmed,
+  });
+
+  await mutateTour(tourId, (current) => {
+    const target = current.clips.find((item) => item.id === clipId);
+    if (target) {
+      target.prompt = prompt;
+      target.revision_note = trimmed;
+      target.updated_at = new Date().toISOString();
+    }
+    const planEdge = current.walkthrough_plan?.transitions.find(
+      (item) =>
+        item.from_photo_id === start.id && item.to_photo_id === end.id,
+    );
+    if (planEdge) {
+      planEdge.higgsfield_prompt = prompt;
+      planEdge.camera_path = cameraPath || planEdge.camera_path;
+      planEdge.spatial_relationship = spatial || planEdge.spatial_relationship;
+      if (shared.length) planEdge.shared_elements = shared;
+    }
+  });
+
+  return prompt;
+}
+
 export async function curateTourPhotos(tourId: string) {
   await mutateTour(tourId, (record) => {
     record.tour.status = "curating";
@@ -771,11 +1113,14 @@ export async function curateTourPhotos(tourId: string) {
     const included = record.photos.filter((photo) => !photo.rejected);
     if (included.length >= 2 && hasVisionEnv()) {
       record.tour.progress_label = "Mapping layout and sequencing photos…";
-      const plan = await planWalkthroughSequence(included);
-      const byId = new Map(record.photos.map((photo) => [photo.id, photo]));
-      const sequenced = plan.photo_sequence
-        .map((id) => byId.get(id))
-        .filter((photo): photo is Photo => Boolean(photo));
+      const uploadOrdered = [...included].sort(
+        (a, b) => a.sort_order - b.sort_order,
+      );
+      const initialPlan = await planWalkthroughSequence(uploadOrdered);
+      const { ordered: sequenced, plan } = await refineSameRoomWalkOrder(
+        uploadOrdered,
+        initialPlan,
+      );
       const rejected = record.photos.filter((photo) => photo.rejected);
       record.photos = [...sequenced, ...rejected];
       record.photos.forEach((photo, index) => {

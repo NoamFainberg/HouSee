@@ -52,8 +52,8 @@ export function videoFallbackModel(): string {
 }
 
 export function clipDurationSeconds(): number {
-  const parsed = Number(process.env.HF_CLIP_DURATION ?? "4");
-  if (!Number.isFinite(parsed)) return 4;
+  const parsed = Number(process.env.HF_CLIP_DURATION ?? "6");
+  if (!Number.isFinite(parsed)) return 6;
   return Math.min(10, Math.max(3, Math.round(parsed)));
 }
 

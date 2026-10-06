@@ -11,11 +11,13 @@ import {
   submitWalkthroughGeneration,
   uploadToHiggsfield,
 } from "./higgsfield";
-import { generatePhotoHoldClip } from "./hold";
 import { stitchTour } from "./stitch";
+import { generatePhotoHoldClip } from "./hold";
 import {
   enrichClipPrompt,
   enrichTransitionPrompts,
+  refreshPlanForUserSequence,
+  reviseClipFromFeedback,
 } from "./vision";
 import {
   mutateTour,
@@ -74,42 +76,12 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
       });
     } else {
       const plan = record.walkthrough_plan;
-      const ordered = plan?.photo_sequence.length
-        ? plan.photo_sequence
-            .map((id) => photos.find((photo) => photo.id === id))
-            .filter((photo): photo is Photo => Boolean(photo))
-        : photos;
-
-      const sameRoom =
-        ordered.length >= 3 &&
-        ordered.every((photo) => photo.room_type === ordered[0]!.room_type);
+      // The sequence the user arranged is the walk. Every step is a drone blend
+      // into the next photo — stills with hard cuts are not a tour.
       let clipIndex = 0;
-
-      if (sameRoom) {
-        clips.push({
-          id: crypto.randomUUID(),
-          tour_id: tourId,
-          photo_id: ordered[0]!.id,
-          end_photo_id: null,
-          room_type: ordered[0]!.room_type,
-          sort_order: clipIndex,
-          status: "pending",
-          prompt: null,
-          camera_move: "hold",
-          higgsfield_request_id: null,
-          video_path: null,
-          video_url: null,
-          error: null,
-          created_at: now,
-          updated_at: now,
-        });
-        clipIndex += 1;
-      }
-
-      const morphStart = sameRoom ? 1 : 0;
-      for (let index = morphStart; index < ordered.length - 1; index += 1) {
-        const start = ordered[index]!;
-        const end = ordered[index + 1]!;
+      for (let index = 0; index < photos.length - 1; index += 1) {
+        const start = photos[index]!;
+        const end = photos[index + 1]!;
         const edge = plan?.transitions.find(
           (item) =>
             item.from_photo_id === start.id && item.to_photo_id === end.id,
@@ -126,6 +98,8 @@ export async function buildClipPlan(tourId: string): Promise<Clip[]> {
             edge?.higgsfield_prompt ??
             transitionPrompt(start.room_type, end.room_type),
           camera_move: "spatial_blend",
+          hold_seconds: null,
+          revision_note: null,
           higgsfield_request_id: null,
           video_path: null,
           video_url: null,
@@ -234,25 +208,27 @@ export async function generateOneClip(
   const startPhoto = record.photos.find((photo) => photo.id === clip.photo_id);
   if (!startPhoto) throw new Error("Start photo not found");
 
-  if (clip.camera_move === "hold") {
-    await mutateTour(tourId, (current) => {
-      current.tour.progress_label = "Rendering opening still…";
-      current.tour.updated_at = new Date().toISOString();
-      const target = current.clips.find((item) => item.id === clipId);
-      if (!target) return;
-      target.status = "submitted";
-      target.updated_at = new Date().toISOString();
-    });
+  if (clip.camera_move === "photo_hold") {
+    const holdLabel = ROOM_LABELS[(clip.room_type as RoomType) ?? startPhoto.room_type];
+    await touchTourProgress(
+      tourId,
+      clipId,
+      holdLabel,
+      `Rendering ${holdLabel} hold…`,
+    );
     const storagePath = await generatePhotoHoldClip(
       tourId,
       clip.id,
       startPhoto,
+      clip.hold_seconds ?? 2.5,
+      true,
     );
     await mutateTour(tourId, (current) => {
       const target = current.clips.find((item) => item.id === clipId);
       if (!target) return;
       target.status = "completed";
       target.video_path = storagePath;
+      target.video_url = null;
       target.error = null;
       target.updated_at = new Date().toISOString();
       current.tour.updated_at = new Date().toISOString();
@@ -370,6 +346,10 @@ export async function runTourPipeline(
       record.tour.updated_at = new Date().toISOString();
     });
 
+    if (!options?.resume) {
+      await refreshPlanForUserSequence(tourId);
+    }
+
     const clips = options?.resume
       ? await prepareResumeClips(tourId)
       : await buildClipPlan(tourId);
@@ -401,8 +381,8 @@ export async function runTourPipeline(
         record.tour.clip_count = refreshedClips.length;
         record.tour.progress_label =
           pendingClips.length > 1 && concurrency > 1
-            ? `Rendering ${pendingClips.length} transitions in parallel…`
-            : `Rendering ${pendingClips.length} transition…`;
+            ? `Blending ${pendingClips.length} shots in parallel…`
+            : `Blending ${pendingClips.length} shot${pendingClips.length === 1 ? "" : "s"}…`;
         record.tour.updated_at = new Date().toISOString();
       });
 
@@ -412,11 +392,9 @@ export async function runTourPipeline(
         concurrency,
         async (clip, index) => {
           const room = (clip.room_type as RoomType) ?? "other";
-          const endPhoto = clip.end_photo_id
-            ? photos.find((photo) => photo.id === clip.end_photo_id)
-            : undefined;
-          const label = endPhoto
-            ? clipLabel(room, endPhoto.room_type)
+          const startIndex = photos.findIndex((photo) => photo.id === clip.photo_id);
+          const label = clip.end_photo_id
+            ? `shot ${startIndex + 1} → ${startIndex + 2}`
             : ROOM_LABELS[room];
 
           await mutateTour(tourId, (record) => {
@@ -477,7 +455,11 @@ export async function runTourPipeline(
   }
 }
 
-export async function retryClipAndMaybeStitch(tourId: string, clipId: string) {
+export async function retryClipAndMaybeStitch(
+  tourId: string,
+  clipId: string,
+  note?: string,
+) {
   const record = await readTourRecord(tourId);
   const clip = record.clips.find((item) => item.id === clipId);
   if (!clip) throw new Error("Clip does not belong to this tour");
@@ -493,7 +475,9 @@ export async function retryClipAndMaybeStitch(tourId: string, clipId: string) {
   await mutateTour(tourId, (current) => {
     current.tour.status = "generating";
     current.tour.error = null;
-    current.tour.progress_label = `Retrying ${label}…`;
+    current.tour.progress_label = note?.trim()
+      ? `Replacing ${label}…`
+      : `Retrying ${label}…`;
     current.tour.updated_at = new Date().toISOString();
     const target = current.clips.find((item) => item.id === clipId);
     if (target) {
@@ -506,7 +490,9 @@ export async function retryClipAndMaybeStitch(tourId: string, clipId: string) {
   });
 
   try {
-    if (clip.end_photo_id) {
+    if (note?.trim()) {
+      await reviseClipFromFeedback(tourId, clipId, note);
+    } else if (clip.end_photo_id) {
       await enrichClipPrompt(tourId, clipId);
     }
     await generateOneClip(tourId, clipId);

@@ -73,6 +73,10 @@ export type Clip = {
   status: ClipStatus;
   prompt: string | null;
   camera_move: string | null;
+  /** Duration for locally rendered photo_hold clips (seconds). */
+  hold_seconds?: number | null;
+  /** User description of what is wrong with this reel, used on the last replace. */
+  revision_note?: string | null;
   higgsfield_request_id: string | null;
   video_path: string | null;
   video_url: string | null;
